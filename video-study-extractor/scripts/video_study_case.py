@@ -26,6 +26,17 @@ VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".flv", ".m4v"}
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".flac", ".aac", ".ogg"}
 SUBTITLE_EXTS = {".srt", ".vtt", ".ass", ".txt"}
 URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+STUDY_PACK_FILES = [
+    "00_overview.md",
+    "01_full_notes.md",
+    "02_timeline.md",
+    "03_key_knowledge.md",
+    "04_corrections_and_supplements.md",
+    "05_quiz.md",
+    "06_flashcards.md",
+    "07_guided_learning_plan.md",
+    "08_practice_checklist.md",
+]
 
 
 def sha256_text(value: str) -> str:
@@ -232,11 +243,11 @@ def read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def create_case(args: argparse.Namespace) -> None:
-    info = classify_input(args.input)
-    fingerprint = sha256_text(args.input)[:12]
-    base = safe_name(Path(info.get("path") or args.input).stem if info.get("path") else info.get("platform") or "input")
-    case_dir = Path(args.out).resolve() / f"{base}-{fingerprint}"
+def build_case(args_input: str, out_dir: Path) -> Path:
+    info = classify_input(args_input)
+    fingerprint = sha256_text(args_input)[:12]
+    base = safe_name(Path(info.get("path") or args_input).stem if info.get("path") else info.get("platform") or "input")
+    case_dir = out_dir.resolve() / f"{base}-{fingerprint}"
 
     for sub in [
         "input",
@@ -279,7 +290,32 @@ def create_case(args: argparse.Namespace) -> None:
 
     write_json(case_dir / "metadata.json", metadata)
     (case_dir / "study_plan.md").write_text(make_plan(metadata), encoding="utf-8")
+    return case_dir
+
+
+def create_case(args: argparse.Namespace) -> None:
+    case_dir = build_case(args.input, Path(args.out))
     print(str(case_dir))
+
+
+def create_folder_cases(args: argparse.Namespace) -> None:
+    folder = Path(args.input).resolve()
+    if not folder.exists() or not folder.is_dir():
+        raise NotADirectoryError(str(folder))
+    media = [
+        p for p in folder.rglob("*")
+        if p.is_file() and p.suffix.lower() in VIDEO_EXTS | AUDIO_EXTS | SUBTITLE_EXTS
+    ]
+    media.sort()
+    out_dir = Path(args.out)
+    created = []
+    for path in media:
+        case_dir = build_case(str(path), out_dir)
+        created.append({"input": str(path), "case": str(case_dir)})
+    index = {"source_folder": str(folder), "count": len(created), "cases": created}
+    out_dir.mkdir(parents=True, exist_ok=True)
+    write_json(out_dir.resolve() / "folder_cases.json", index)
+    print(str(out_dir.resolve() / "folder_cases.json"))
 
 
 def extract_audio(ffmpeg: str, source: Path, out_wav: Path) -> None:
@@ -337,6 +373,78 @@ def extract_uniform_keyframes(ffmpeg: str, source: Path, duration: float, out_di
             "reason": "uniform_sample",
         })
     return index
+
+
+def extract_scene_keyframes(
+    ffmpeg: str,
+    source: Path,
+    out_dir: Path,
+    threshold: float,
+    max_frames: int,
+) -> list[dict]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pattern = out_dir / "scene_%03d.jpg"
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-i",
+        str(source),
+        "-vf",
+        f"select='gt(scene,{threshold})',showinfo",
+        "-vsync",
+        "vfr",
+        "-frames:v",
+        str(max_frames),
+        "-q:v",
+        "2",
+        str(pattern),
+    ]
+    p = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if p.returncode != 0:
+        raise RuntimeError(f"Scene keyframe extraction failed:\n{p.stdout}")
+    pts_times = [float(m.group(1)) for m in re.finditer(r"pts_time:([0-9.]+)", p.stdout)]
+    files = sorted(out_dir.glob("scene_*.jpg"))
+    index = []
+    for idx, frame_path in enumerate(files[:max_frames], start=1):
+        ts = pts_times[idx - 1] if idx - 1 < len(pts_times) else None
+        if ts is not None:
+            new_name = f"scene_{idx:03d}_{format_timestamp(ts).replace(':', '-').replace('.', '-')}.jpg"
+            new_path = out_dir / new_name
+            if new_path != frame_path:
+                frame_path.rename(new_path)
+                frame_path = new_path
+        index.append({
+            "index": idx,
+            "timestamp_seconds": round(ts, 3) if ts is not None else None,
+            "timestamp": format_timestamp(ts) if ts is not None else None,
+            "file": str(frame_path),
+            "reason": "scene_change",
+            "threshold": threshold,
+        })
+    return index
+
+
+def merge_keyframe_indexes(*indexes: list[dict]) -> list[dict]:
+    merged = []
+    seen_files = set()
+    for index in indexes:
+        for item in index:
+            file_path = item.get("file")
+            if file_path in seen_files:
+                continue
+            seen_files.add(file_path)
+            merged.append(item)
+    merged.sort(key=lambda item: (item.get("timestamp_seconds") is None, item.get("timestamp_seconds") or 0.0))
+    for idx, item in enumerate(merged, start=1):
+        item["merged_index"] = idx
+    return merged
 
 
 def write_segments_outputs(segments: list[dict], transcript_dir: Path) -> None:
@@ -429,15 +537,34 @@ def process_local(args: argparse.Namespace) -> None:
         process_report["warnings"].append("No audio stream found; transcription skipped.")
 
     if input_info.get("kind") == "local_video" and has_video_stream(probe):
-        keyframes = extract_uniform_keyframes(
+        uniform_keyframes = extract_uniform_keyframes(
             ffmpeg,
             source,
             duration,
             case_dir / "keyframes",
             args.keyframes,
         )
-        write_json(case_dir / "keyframes" / "keyframes.json", {"frames": keyframes})
-        process_report["keyframes"] = {"count": len(keyframes), "index": "keyframes/keyframes.json"}
+        scene_keyframes = []
+        if args.scene_keyframes > 0:
+            scene_keyframes = extract_scene_keyframes(
+                ffmpeg,
+                source,
+                case_dir / "keyframes" / "scene",
+                args.scene_threshold,
+                args.scene_keyframes,
+            )
+        keyframes = merge_keyframe_indexes(uniform_keyframes, scene_keyframes)
+        write_json(case_dir / "keyframes" / "keyframes.json", {
+            "frames": keyframes,
+            "uniform_count": len(uniform_keyframes),
+            "scene_count": len(scene_keyframes),
+        })
+        process_report["keyframes"] = {
+            "count": len(keyframes),
+            "uniform_count": len(uniform_keyframes),
+            "scene_count": len(scene_keyframes),
+            "index": "keyframes/keyframes.json",
+        }
     else:
         process_report["warnings"].append("No video stream found; keyframe extraction skipped.")
 
@@ -461,6 +588,194 @@ def process_local(args: argparse.Namespace) -> None:
     write_json(case_dir / "reports" / "process_local.json", process_report)
     (case_dir / "analysis" / "next_agent_steps.md").write_text(make_next_agent_steps(process_report), encoding="utf-8")
     print(str(case_dir / "reports" / "process_local.json"))
+
+
+def write_study_pack_template(args: argparse.Namespace) -> None:
+    case_dir = Path(args.case).resolve()
+    metadata_path = case_dir / "metadata.json"
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"metadata.json not found: {metadata_path}")
+    metadata = read_json(metadata_path)
+    study_pack = case_dir / "study_pack"
+    study_pack.mkdir(parents=True, exist_ok=True)
+    templates = {
+        "00_overview.md": overview_template(metadata),
+        "01_full_notes.md": full_notes_template(),
+        "02_timeline.md": timeline_template(),
+        "03_key_knowledge.md": key_knowledge_template(),
+        "04_corrections_and_supplements.md": corrections_template(),
+        "05_quiz.md": quiz_template(),
+        "06_flashcards.md": flashcards_template(),
+        "07_guided_learning_plan.md": guided_plan_template(),
+        "08_practice_checklist.md": practice_template(),
+    }
+    for name, content in templates.items():
+        path = study_pack / name
+        if args.force or not path.exists():
+            path.write_text(content, encoding="utf-8")
+    print(str(study_pack))
+
+
+def overview_template(metadata: dict[str, Any]) -> str:
+    source = metadata.get("input", {}).get("path") or metadata.get("input", {}).get("raw_input")
+    return f"""# 一页速览
+
+来源：`{source}`
+
+## 视频主题
+
+TODO
+
+## 适合谁学
+
+TODO
+
+## 前置知识
+
+TODO
+
+## 核心收获
+
+- TODO
+
+## 最值得回看的时间点
+
+- [00:00:00] TODO
+
+## 学习建议
+
+TODO
+"""
+
+
+def full_notes_template() -> str:
+    return """# 完整学习笔记
+
+## [00:00:00-00:00:00] 章节标题
+
+讲了什么：
+
+关键知识：
+
+画面补充：
+
+需要记住：
+
+可操作步骤：
+"""
+
+
+def timeline_template() -> str:
+    return """# 时间轴
+
+- [00:00:00] TODO
+"""
+
+
+def key_knowledge_template() -> str:
+    return """# 关键知识点
+
+## 知识点
+
+定义：
+
+为什么重要：
+
+视频证据：
+
+相关时间点：
+
+常见误区：
+"""
+
+
+def corrections_template() -> str:
+    return """# 视频纠错与补充
+
+## [00:00:00] 待核查说法
+
+视频原说法：
+
+核查结论：正确 / 基本正确但不完整 / 有争议 / 疑似错误 / 错误 / 无法核查
+
+依据：
+
+建议学习者采用的说法：
+"""
+
+
+def quiz_template() -> str:
+    return """# 复习题
+
+## 基础题
+
+1. TODO
+
+## 理解题
+
+1. TODO
+
+## 应用题
+
+1. TODO
+
+## 答案
+
+1. TODO
+"""
+
+
+def flashcards_template() -> str:
+    return """# 闪卡
+
+Q: TODO
+
+A: TODO
+
+Source: [00:00:00]
+"""
+
+
+def guided_plan_template() -> str:
+    return """# AI 导学路线
+
+## 学习顺序
+
+1. TODO
+
+## 需要暂停练习的地方
+
+- [00:00:00] TODO
+
+## AI 应该如何带学
+
+- TODO
+
+## 完成标准
+
+- TODO
+"""
+
+
+def practice_template() -> str:
+    return """# 实操清单
+
+## 环境准备
+
+- TODO
+
+## 操作步骤
+
+1. TODO
+
+## 验证方法
+
+- TODO
+
+## 常见错误
+
+- TODO
+"""
 
 
 def make_next_agent_steps(report: dict[str, Any]) -> str:
@@ -531,16 +846,8 @@ def make_plan(metadata: dict) -> str:
         "",
         "## Required Outputs",
         "",
-        "- `study_pack/00_overview.md`",
-        "- `study_pack/01_full_notes.md`",
-        "- `study_pack/02_timeline.md`",
-        "- `study_pack/03_key_knowledge.md`",
-        "- `study_pack/04_corrections_and_supplements.md`",
-        "- `study_pack/05_quiz.md`",
-        "- `study_pack/06_flashcards.md`",
-        "- `study_pack/07_guided_learning_plan.md`",
-        "- `study_pack/08_practice_checklist.md`",
     ]
+    lines += [f"- `study_pack/{name}`" for name in STUDY_PACK_FILES]
     return "\n".join(lines) + "\n"
 
 
@@ -553,14 +860,26 @@ def main(argv: list[str] | None = None) -> int:
     init.add_argument("--out", required=True, help="Output directory for case workspaces")
     init.set_defaults(func=create_case)
 
+    folder = sub.add_parser("init-folder", help="Create cases for every media/subtitle file in a folder")
+    folder.add_argument("--input", required=True, help="Folder containing media files")
+    folder.add_argument("--out", required=True, help="Output directory for case workspaces")
+    folder.set_defaults(func=create_folder_cases)
+
     process = sub.add_parser("process-local", help="Extract audio/keyframes and optionally transcribe a local media case")
     process.add_argument("--case", required=True, help="Case directory created by init")
     process.add_argument("--keyframes", type=int, default=30, help="Number of uniform keyframes to extract")
+    process.add_argument("--scene-keyframes", type=int, default=20, help="Maximum scene-change keyframes to extract")
+    process.add_argument("--scene-threshold", type=float, default=0.35, help="FFmpeg scene-change threshold")
     process.add_argument("--transcribe", action="store_true", help="Transcribe extracted audio with faster-whisper")
     process.add_argument("--model", default="small", help="faster-whisper model size or local model path")
     process.add_argument("--language", default="zh", help="Transcription language, or empty string for auto")
     process.add_argument("--max-single-minutes", type=int, default=60, help="Warn when media exceeds this length")
     process.set_defaults(func=process_local)
+
+    pack = sub.add_parser("study-pack-template", help="Create editable study pack template files for a case")
+    pack.add_argument("--case", required=True, help="Case directory created by init")
+    pack.add_argument("--force", action="store_true", help="Overwrite existing template files")
+    pack.set_defaults(func=write_study_pack_template)
 
     args = parser.parse_args(argv)
     if hasattr(args, "language") and args.language == "":

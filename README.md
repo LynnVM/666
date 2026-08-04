@@ -54,9 +54,10 @@ This repository is still early, but it now contains a usable local-media pipelin
 - Classify local files, folders, URLs, and share text.
 - Probe local media when `ffprobe` is available.
 - Extract 16 kHz mono WAV audio from local videos.
-- Extract timestamped uniform keyframes from local videos.
+- Extract timestamped uniform and scene-change keyframes from local videos.
 - Optionally transcribe audio with `faster-whisper`.
-- Generate `metadata.json`, `study_plan.md`, `keyframes/keyframes.json`, `transcript/`, and `reports/process_local.json`.
+- Create editable study-pack templates.
+- Generate `metadata.json`, `study_plan.md`, `keyframes/keyframes.json`, `transcript/`, `reports/process_local.json`, and `study_pack/`.
 
 Platform URL adapters are specified but not yet fully automated. For Bilibili, Douyin, Xiaohongshu, and similar sites, the most reliable current path is to provide a local downloaded video.
 
@@ -90,16 +91,28 @@ Create a case workspace:
 python .\video-study-extractor\scripts\video_study_case.py init --input "D:\Videos\lesson.mp4" --out ".\video-study-cases"
 ```
 
+For a folder of videos:
+
+```powershell
+python .\video-study-extractor\scripts\video_study_case.py init-folder --input "D:\Videos\Course" --out ".\video-study-cases"
+```
+
 The script prints the created case directory. Then process local media:
 
 ```powershell
-python .\video-study-extractor\scripts\video_study_case.py process-local --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --keyframes 30
+python .\video-study-extractor\scripts\video_study_case.py process-local --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --keyframes 30 --scene-keyframes 20
 ```
 
 To also transcribe with faster-whisper:
 
 ```powershell
-python .\video-study-extractor\scripts\video_study_case.py process-local --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --keyframes 30 --transcribe --model small --language zh
+python .\video-study-extractor\scripts\video_study_case.py process-local --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --keyframes 30 --scene-keyframes 20 --transcribe --model small --language zh
+```
+
+Create editable study-pack files:
+
+```powershell
+python .\video-study-extractor\scripts\video_study_case.py study-pack-template --case ".\video-study-cases\lesson-xxxxxxxxxxxx"
 ```
 
 After processing, ask Codex to inspect the generated case and produce the study pack:
@@ -110,8 +123,8 @@ Use $video-study-extractor to finish the study pack for .\video-study-cases\less
 
 ## Roadmap
 
-- `v0.2`: Better local pipeline, scene-change keyframes, folder batching.
-- `v0.3`: Study pack generation helpers and stronger transcript/keyframe fusion.
-- `v0.4`: Bilibili/YouTube public URL adapters.
-- `v0.5`: Douyin/Xiaohongshu share-link fallbacks and stronger OCR.
+- `v0.3`: Scene-change keyframes, folder batching, and study-pack templates.
+- `v0.4`: Study pack generation helpers and stronger transcript/keyframe fusion.
+- `v0.5`: Bilibili/YouTube public URL adapters.
+- `v0.6`: Douyin/Xiaohongshu share-link fallbacks and stronger OCR.
 - `v1.0`: Stable multi-platform video learning coach with fact-checking and guided study.

@@ -84,6 +84,12 @@ For a local video or folder, first create a case workspace:
 python <skill>/scripts/video_study_case.py init --input "D:\Videos\lesson.mp4" --out ".\video-study-cases"
 ```
 
+For a folder of videos:
+
+```powershell
+python <skill>/scripts/video_study_case.py init-folder --input "D:\Videos\Course" --out ".\video-study-cases"
+```
+
 For share text or a URL:
 
 ```powershell
@@ -93,13 +99,19 @@ python <skill>/scripts/video_study_case.py init --input "https://www.bilibili.co
 Then process local media when the case contains a local video or audio file:
 
 ```powershell
-python <skill>/scripts/video_study_case.py process-local --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --keyframes 30
+python <skill>/scripts/video_study_case.py process-local --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --keyframes 30 --scene-keyframes 20
 ```
 
 Use optional transcription when `faster-whisper` is installed:
 
 ```powershell
-python <skill>/scripts/video_study_case.py process-local --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --keyframes 30 --transcribe --model small --language zh
+python <skill>/scripts/video_study_case.py process-local --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --keyframes 30 --scene-keyframes 20 --transcribe --model small --language zh
+```
+
+Create editable study pack files when the user wants a ready-to-fill output scaffold:
+
+```powershell
+python <skill>/scripts/video_study_case.py study-pack-template --case ".\video-study-cases\lesson-xxxxxxxxxxxx"
 ```
 
 After processing, read `metadata.json`, `reports/process_local.json`, `transcript/transcript.txt` if present, and `keyframes/keyframes.json`. Inspect the listed keyframes with vision tools before producing the study pack.
@@ -115,7 +127,7 @@ After processing, read `metadata.json`, `reports/process_local.json`, `transcrip
 
 ## Bundled Resources
 
-- `scripts/video_study_case.py`: Create case workspaces, classify inputs, extract URLs from share text, generate processing plans, extract local audio, extract timestamped keyframes, and optionally transcribe with faster-whisper.
+- `scripts/video_study_case.py`: Create case workspaces, batch-create cases from folders, classify inputs, extract URLs from share text, generate processing plans, extract local audio, extract uniform and scene-change keyframes, optionally transcribe with faster-whisper, and create study-pack template files.
 - `references/platform-adapters.md`: Platform adapter strategy and fallback behavior for local files, Bilibili, Douyin, Xiaohongshu, YouTube, and generic URLs.
 - `references/output-templates.md`: Required study pack structure and formatting.
 - `references/fact-checking.md`: Claim extraction, source priority, correction report rules.
