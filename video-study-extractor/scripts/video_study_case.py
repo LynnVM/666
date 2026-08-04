@@ -521,7 +521,18 @@ def study_url(args: argparse.Namespace) -> None:
         if step.get("status") == "failed"
     ]
     errors = [f"{step.get('name')}: {step.get('error')}" for step in failed_steps]
-    complete = study_session.exists() and all(path.exists() for path in study_pack_files)
+    evidence_ready = bool(media_file) or any([
+        (active_case / "transcript" / "segments.json").exists(),
+        (active_case / "transcript" / "transcript.txt").exists(),
+        (active_case / "transcript" / "clean_segments.json").exists(),
+        any((active_case / "transcript" / "subtitles").glob(pattern) for pattern in ["*.srt", "*.vtt", "*.txt"]),
+    ])
+    complete = (
+        evidence_ready
+        and not failed_steps
+        and study_session.exists()
+        and all(path.exists() for path in study_pack_files)
+    )
     final_report = {
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "input": args.input,
@@ -716,6 +727,8 @@ def extract_scene_keyframes(
     max_frames: int,
 ) -> list[dict]:
     out_dir.mkdir(parents=True, exist_ok=True)
+    for old_frame in out_dir.glob("scene_*.jpg"):
+        old_frame.unlink()
     pattern = out_dir / "scene_%03d.jpg"
     cmd = [
         ffmpeg,
@@ -817,37 +830,50 @@ def transcribe_audio(
             "error": f"faster-whisper unavailable: {exc}",
             "next_step": "Install faster-whisper or provide an existing subtitle file.",
         }
-    try:
-        model = WhisperModel(model_size, device=device, compute_type=compute_type)
-        segments_iter, info = model.transcribe(str(audio_path), language=language)
-        segments = [
-            {"start": seg.start, "end": seg.end, "text": seg.text}
-            for seg in segments_iter
-        ]
-        write_segments_outputs(segments, transcript_dir)
-        return {
-            "available": True,
-            "model_size": model_size,
-            "requested_device": requested_device,
-            "requested_compute_type": requested_compute_type,
-            "device": device,
-            "compute_type": compute_type,
-            "runtime_note": runtime_note,
-            "language": getattr(info, "language", language),
-            "language_probability": getattr(info, "language_probability", None),
-            "segments": len(segments),
-        }
-    except Exception as exc:  # noqa: BLE001
-        return {
-            "available": False,
-            "error": f"faster-whisper transcription failed: {exc}",
-            "model_size": model_size,
-            "requested_device": requested_device,
-            "requested_compute_type": requested_compute_type,
-            "device": device,
-            "compute_type": compute_type,
-            "next_step": "Retry with --device cpu --compute-type int8, clear a broken model cache, use another model size, or provide a subtitle file.",
-        }
+    attempts = [(device, compute_type, runtime_note)]
+    allow_cpu_fallback = requested_device == "auto" or device == "cuda"
+    if allow_cpu_fallback and (device, compute_type) != ("cpu", "int8"):
+        attempts.append(("cpu", "int8", f"fallback after {device}/{compute_type} failure"))
+    errors = []
+    for attempt_device, attempt_compute_type, attempt_note in attempts:
+        try:
+            model = WhisperModel(model_size, device=attempt_device, compute_type=attempt_compute_type)
+            segments_iter, info = model.transcribe(str(audio_path), language=language)
+            segments = [
+                {"start": seg.start, "end": seg.end, "text": seg.text}
+                for seg in segments_iter
+            ]
+            write_segments_outputs(segments, transcript_dir)
+            return {
+                "available": True,
+                "model_size": model_size,
+                "requested_device": requested_device,
+                "requested_compute_type": requested_compute_type,
+                "device": attempt_device,
+                "compute_type": attempt_compute_type,
+                "runtime_note": attempt_note,
+                "fallback_errors": errors,
+                "language": getattr(info, "language", language),
+                "language_probability": getattr(info, "language_probability", None),
+                "segments": len(segments),
+            }
+        except Exception as exc:  # noqa: BLE001
+            errors.append({
+                "device": attempt_device,
+                "compute_type": attempt_compute_type,
+                "error": str(exc),
+            })
+    return {
+        "available": False,
+        "error": f"faster-whisper transcription failed after {len(attempts)} attempt(s): {errors[-1]['error'] if errors else 'unknown error'}",
+        "model_size": model_size,
+        "requested_device": requested_device,
+        "requested_compute_type": requested_compute_type,
+        "device": attempts[-1][0],
+        "compute_type": attempts[-1][1],
+        "fallback_errors": errors,
+        "next_step": "Retry with --device cpu --compute-type int8, clear a broken model cache, use another model size, or provide a subtitle file.",
+    }
 
 
 def resolve_transcription_runtime(device: str, compute_type: str) -> tuple[str, str, str]:
@@ -1733,6 +1759,7 @@ def export_study_session(args: argparse.Namespace) -> None:
     session = {
         "case": str(case_dir),
         "source": source_label(metadata),
+        "metadata": metadata,
         "chapters": chapters,
         "fact_check_queue": queue,
         "keyframes": keyframes,
@@ -1766,8 +1793,10 @@ def run_pipeline(args: argparse.Namespace) -> None:
         "steps": [],
     }
     for step in steps:
-        item = {"name": step["name"], "enabled": step["enabled"], "reason": step["reason"], "status": "skipped"}
-        if not step["enabled"]:
+        enabled = bool(step["enabled"]() if callable(step["enabled"]) else step["enabled"])
+        reason = step["reason"]() if callable(step["reason"]) else step["reason"]
+        item = {"name": step["name"], "enabled": enabled, "reason": reason, "status": "skipped"}
+        if not enabled:
             report["steps"].append(item)
             continue
         if args.dry_run:
@@ -1796,18 +1825,40 @@ def pipeline_steps(case_dir: Path, metadata: dict[str, Any], args: argparse.Name
     kind = input_info.get("kind")
     steps = []
 
-    def add(name: str, enabled: bool, reason: str, func: Any) -> None:
+    def add(name: str, enabled: Any, reason: Any, func: Any) -> None:
         steps.append({"name": name, "enabled": enabled, "reason": reason, "func": func})
 
-    transcript_ready = (case_dir / "transcript" / "segments.json").exists() or (case_dir / "transcript" / "transcript.txt").exists()
-    subtitle_ready = any((case_dir / "transcript" / "subtitles").glob(pattern) for pattern in ["*.srt", "*.vtt", "*.txt"])
-    transcript_source_ready = transcript_ready or subtitle_ready or (case_dir / "transcript" / "clean_segments.json").exists()
-    keyframes_ready = (case_dir / "keyframes" / "keyframes.json").exists()
-    study_pack_ready = all((case_dir / "study_pack" / name).exists() for name in STUDY_PACK_FILES)
+    def transcript_ready() -> bool:
+        return (case_dir / "transcript" / "segments.json").exists() or (case_dir / "transcript" / "transcript.txt").exists()
+
+    def subtitle_ready() -> bool:
+        return any((case_dir / "transcript" / "subtitles").glob(pattern) for pattern in ["*.srt", "*.vtt", "*.txt"])
+
+    def clean_ready() -> bool:
+        return (case_dir / "transcript" / "clean_segments.json").exists()
+
+    def transcript_source_ready() -> bool:
+        return transcript_ready() or subtitle_ready() or clean_ready()
+
+    def keyframes_ready() -> bool:
+        return (case_dir / "keyframes" / "keyframes.json").exists()
+
+    def study_pack_ready() -> bool:
+        return all((case_dir / "study_pack" / name).exists() for name in STUDY_PACK_FILES)
+
+    def process_report_ready() -> bool:
+        report_path = case_dir / "reports" / "process_local.json"
+        if not report_path.exists():
+            return False
+        if args.transcribe and not transcript_ready():
+            return False
+        if args.keyframes and not keyframes_ready():
+            return False
+        return True
 
     add(
         "acquire-url",
-        kind in {"url", "share_text"} and not (case_dir / "reports" / "acquire_url.json").exists(),
+        lambda: kind in {"url", "share_text"} and not (case_dir / "reports" / "acquire_url.json").exists(),
         "URL/share case has not been acquired.",
         lambda: acquire_url(argparse.Namespace(
             case=str(case_dir),
@@ -1821,8 +1872,10 @@ def pipeline_steps(case_dir: Path, metadata: dict[str, Any], args: argparse.Name
     )
     add(
         "process-local",
-        kind in {"local_video", "local_audio"} and args.process_local and not (case_dir / "reports" / "process_local.json").exists(),
-        "Local media has not been processed.",
+        lambda: kind in {"local_video", "local_audio"} and args.process_local and not process_report_ready(),
+        lambda: "Local media has not been processed." if not (case_dir / "reports" / "process_local.json").exists()
+        else "Existing local processing outputs satisfy requested media, keyframe, and transcript settings." if process_report_ready()
+        else "Existing local processing report is incomplete for requested outputs.",
         lambda: process_local(argparse.Namespace(
             case=str(case_dir),
             keyframes=args.keyframes,
@@ -1838,8 +1891,8 @@ def pipeline_steps(case_dir: Path, metadata: dict[str, Any], args: argparse.Name
     )
     add(
         "clean-transcript",
-        (transcript_ready or subtitle_ready) and not (case_dir / "transcript" / "clean_segments.json").exists(),
-        "Transcript exists but has not been cleaned.",
+        lambda: (transcript_ready() or subtitle_ready()) and not clean_ready(),
+        lambda: "Transcript has already been cleaned." if clean_ready() else "Transcript exists but has not been cleaned.",
         lambda: clean_transcript(argparse.Namespace(
             case=str(case_dir),
             source=None,
@@ -1851,8 +1904,8 @@ def pipeline_steps(case_dir: Path, metadata: dict[str, Any], args: argparse.Name
     )
     add(
         "normalize-transcript",
-        (case_dir / "transcript" / "clean_segments.json").exists() and not (case_dir / "reports" / "normalize_transcript.json").exists(),
-        "Transcript exists but has not been normalized to simplified Chinese/technical terms.",
+        lambda: clean_ready() and not (case_dir / "reports" / "normalize_transcript.json").exists(),
+        lambda: "Transcript has already been normalized." if (case_dir / "reports" / "normalize_transcript.json").exists() else "Transcript exists but has not been normalized to simplified Chinese/technical terms.",
         lambda: normalize_transcript_command(argparse.Namespace(
             case=str(case_dir),
             chapter_minutes=args.chapter_minutes,
@@ -1860,14 +1913,14 @@ def pipeline_steps(case_dir: Path, metadata: dict[str, Any], args: argparse.Name
     )
     add(
         "frame-notes",
-        keyframes_ready and not (case_dir / "analysis" / "frame_observations.md").exists(),
-        "Keyframes exist but visual observation worksheet is missing.",
+        lambda: keyframes_ready() and not (case_dir / "analysis" / "frame_observations.md").exists(),
+        lambda: "Frame observation worksheet already exists." if (case_dir / "analysis" / "frame_observations.md").exists() else "Keyframes exist but visual observation worksheet is missing.",
         lambda: frame_notes(argparse.Namespace(case=str(case_dir), limit=args.frame_limit, context_seconds=15.0)),
     )
     add(
         "generate-study-pack",
-        transcript_source_ready and (not study_pack_ready or args.overwrite_generated),
-        "Study pack has not been generated.",
+        lambda: transcript_source_ready() and (not study_pack_ready() or args.overwrite_generated),
+        lambda: "Study pack will be regenerated because overwrite is enabled." if args.overwrite_generated else "Study pack has not been generated.",
         lambda: generate_study_pack(argparse.Namespace(
             case=str(case_dir),
             chapter_minutes=args.chapter_minutes,
@@ -1878,17 +1931,17 @@ def pipeline_steps(case_dir: Path, metadata: dict[str, Any], args: argparse.Name
     )
     add(
         "fact-check-queue",
-        transcript_source_ready and not (case_dir / "analysis" / "fact_check_queue.json").exists(),
-        "Claim candidates exist but fact-check queue is missing.",
+        lambda: transcript_source_ready() and not (case_dir / "analysis" / "fact_check_queue.json").exists(),
+        lambda: "Fact-check queue already exists." if (case_dir / "analysis" / "fact_check_queue.json").exists() else "Claim candidates exist but fact-check queue is missing.",
         lambda: fact_check_queue(argparse.Namespace(case=str(case_dir), limit=args.claims)),
     )
     add(
         "export-study-session",
-        transcript_source_ready and (
+        lambda: transcript_source_ready() and (
             not (case_dir / "study_pack" / "09_study_session.md").exists()
             or args.overwrite_generated
         ),
-        "Study pack exists but interactive study session is missing.",
+        lambda: "Interactive study session will be regenerated because overwrite is enabled." if args.overwrite_generated else "Study pack exists but interactive study session is missing.",
         lambda: export_study_session(argparse.Namespace(
             case=str(case_dir),
             chapter_minutes=args.chapter_minutes,
@@ -1946,6 +1999,11 @@ def render_study_url_summary(report: dict[str, Any]) -> str:
 
 
 def render_study_session(session: dict[str, Any], questions_per_chapter: int) -> str:
+    context = {
+        "metadata": session.get("metadata") or {"input": {"raw_input": session.get("source")}},
+        "chapters": session.get("chapters", []),
+        "keyframes": session.get("keyframes", []),
+    }
     quality = transcript_quality([
         seg
         for chapter in session.get("chapters", [])
@@ -1998,12 +2056,12 @@ def render_study_session(session: dict[str, Any], questions_per_chapter: int) ->
     for chapter in chapters:
         start = format_timestamp(safe_float(chapter.get("start")))
         end = format_timestamp(safe_float(chapter.get("end")))
-        points = chapter_teaching_points(chapter, {"keyframes": []})
+        points = chapter_teaching_points(chapter, context)
         lines += [
-            f"## 第 {chapter.get('index', '?')} 章：{display_chapter_title(chapter, {'metadata': {'input': {'raw_input': session.get('source')}}, 'chapters': session.get('chapters', [])})}",
+            f"## 第 {chapter.get('index', '?')} 章：{display_chapter_title(chapter, context)}",
             "",
             f"- 时间：[{start} - {end}]",
-            f"- 可信摘要：{chapter_summary(chapter, {'metadata': {'input': {'raw_input': session.get('source')}}, 'chapters': session.get('chapters', [])}, 260)}",
+            f"- 可信摘要：{chapter_summary(chapter, context, 260)}",
             f"- 关键词：{', '.join(clean_keywords(chapter.get('keywords', []), 8)) or '关键词不足，需要回看画面确认'}",
             "",
             "### 本章目标",
@@ -2017,7 +2075,7 @@ def render_study_session(session: dict[str, Any], questions_per_chapter: int) ->
             "",
             *[f"- {point}" for point in points],
             "",
-            "讲的时候不要照念转写。先把本章放进完整链路：硬件接入 -> ROS2 数据 -> SLAM 建图 -> 地图保存 -> Nav2 导航。",
+            f"讲的时候不要照念转写。先把本章放进完整链路：{teaching_chain_hint(context)}。",
             "",
             "### 证据提醒",
             "",
@@ -2052,7 +2110,19 @@ def render_study_session(session: dict[str, Any], questions_per_chapter: int) ->
 def render_replication_route(session: dict[str, Any]) -> list[str]:
     text = " ".join(str(ch.get("text", "")) for ch in session.get("chapters", []))
     source = str(session.get("source") or "")
-    if re.search(r"雷达|lidar|ros2|slam|nav2|rviz|scan|tf|odom", text + source, re.I):
+    if is_low_cost_ros_box_video(text + source):
+        return [
+            "- 第 1 关：确认目标板卡/盒子型号、CPU、内存、存储和启动方式。重点核对 S905L/S905L3A、2G 内存、16G eMMC/USB 启动等信息。",
+            "- 第 2 关：确认镜像来源和刷机方式。准备 U 盘、写盘工具、短接/进入刷机模式的方法，先不要接机器人。",
+            "- 第 3 关：第一次启动 Linux，确认能 SSH 登录板子，并记录板子的 IP、用户名、密码。",
+            "- 第 4 关：确认 ROS2 环境。运行 `ros2 --version`、`ros2 topic list` 或启动一个最小 demo。",
+            "- 第 5 关：把机器人小车相关包、Web 控制台或作者开源镜像部署到板子上。",
+            "- 第 6 关：确认 Web 控制台能连接板子，能看到视频流、摇杆控制、线速度/角速度状态。",
+            "- 第 7 关：启动建图，验证地图能显示并保存。",
+            "- 第 8 关：加载已保存地图，启动导航，验证代价地图、目标点和机器人运动。",
+            "- 第 9 关：如果卡顿或启动失败，按电源、存储、网络、ROS2 环境、驱动包、CPU/内存占用顺序排查。",
+        ]
+    if re.search(r"雷达|lidar|slam|nav2|rviz|scan|tf|odom", text + source, re.I):
         return [
             "- 第 1 关：确认雷达 `/scan` 正常发布。命令：`ros2 topic list`、`ros2 topic echo /scan --once`、`ros2 topic hz /scan`。",
             "- 第 2 关：确认 TF 坐标关系正确。重点看 `base_link` 到雷达 frame 的方向和位置。",
@@ -2071,6 +2141,15 @@ def render_replication_route(session: dict[str, Any]) -> list[str]:
         "- 第 4 关：先复现最小可验证步骤。",
         "- 第 5 关：让用户运行检查命令或完成操作，并根据输出继续纠错。",
     ]
+
+
+def teaching_chain_hint(context: dict[str, Any]) -> str:
+    theme = infer_video_theme(context)
+    if is_low_cost_ros_box_context(context):
+        return "硬件选型 -> 刷 Linux/ROS2 镜像 -> SSH 登录 -> ROS2 环境验证 -> Web 中控台 -> 建图/导航验证"
+    if "ROS2" in theme and "激光雷达" in theme:
+        return "硬件接入 -> ROS2 数据 -> SLAM 建图 -> 地图保存 -> Nav2 导航"
+    return "目标确认 -> 前置条件 -> 最小复现 -> 结果验证 -> 问题排查"
 
 
 def build_chapter_questions(chapter: dict[str, Any], count: int) -> list[str]:
@@ -2748,10 +2827,16 @@ def reliable_text(text: str, max_chars: int = 360) -> str:
 
 def chapter_summary(chapter: dict[str, Any], context: dict[str, Any], max_chars: int = 360) -> str:
     text = chapter.get("text", "")
-    if "本段语音转写可信度不足" not in reliable_text(text, max_chars):
-        return reliable_text(text, max_chars)
     theme = infer_video_theme(context)
     start = safe_float(chapter.get("start"))
+    if is_low_cost_ros_box_context(context):
+        if start < 70:
+            return "本章主要说明：作者用一百多元的晶晨 S905L/S905L3A 盒子替代更贵的树莓派/香橙派来跑 Linux 和 ROS2，并对比 CPU、内存、存储和价格。"
+        if start < 150:
+            return "本章演示实际效果：盒子运行机器人中控台，能显示摄像头、摇杆控制、SLAM 栅格地图、保存地图、加载地图和导航控制。"
+        return "本章讲成本和部署方式：盒子原系统通常是安卓，需要刷入作者适配的 Linux/ROS2 镜像；刷机需要 U 盘和基本动手能力，也可以购买预刷好的版本。"
+    if "本段语音转写可信度不足" not in reliable_text(text, max_chars):
+        return reliable_text(text, max_chars)
     if "ROS2" in theme and "激光雷达" in theme:
         if start < 8 * 60:
             return "本章主要讲低成本激光雷达的硬件接入：拆看雷达接口，确认供电和通信线，把雷达通过串口/USB 转接接入机器人或电脑。重点不是价格，而是能否稳定输出 ROS 可用的扫描数据。"
@@ -2801,9 +2886,29 @@ def clean_keywords(keywords: list[Any], limit: int = 8) -> list[str]:
     return cleaned
 
 
+def is_low_cost_ros_box_video(text: str) -> bool:
+    return bool(
+        re.search(r"s905|s905l|s905l3a|晶晨|盒子|电视盒子|树莓派|香橙派|emmc|刷机|镜像|ssh", text, re.I)
+        and re.search(r"ros2|rose\s*2|建图|导航|slam|mapping|机器人|小车", text, re.I)
+    )
+
+
+def is_low_cost_ros_box_context(context: dict[str, Any]) -> bool:
+    text = " ".join(str(ch.get("text", "")) for ch in context.get("chapters", []))
+    metadata = context.get("metadata") or {"input": {"raw_input": ""}}
+    source = source_label(metadata) if isinstance(metadata, dict) else ""
+    return is_low_cost_ros_box_video(f"{source} {text}")
+
+
 def display_chapter_title(chapter: dict[str, Any], context: dict[str, Any]) -> str:
     start = safe_float(chapter.get("start"))
     theme = infer_video_theme(context)
+    if is_low_cost_ros_box_context(context):
+        if start < 70:
+            return "硬件选型：S905L 盒子对比树莓派和香橙派"
+        if start < 150:
+            return "运行效果：Web 中控台、建图和导航演示"
+        return "部署方式：刷 Linux/ROS2 镜像并通过 SSH 使用"
     if "ROS2" in theme and "激光雷达" in theme:
         if start < 8 * 60:
             return "硬件接入：雷达供电、通信和安装"
@@ -2820,7 +2925,9 @@ def infer_video_theme(context: dict[str, Any]) -> str:
     text = " ".join(ch.get("text", "") for ch in context.get("chapters", []))
     source = Path(source_label(context["metadata"])).stem.lower()
     haystack = f"{source} {text}".lower()
-    if any(k.lower() in haystack for k in ["雷达", "lidar", "ros2", "slam", "nav2", "rviz"]):
+    if is_low_cost_ros_box_video(haystack):
+        return "用一百多元的晶晨 S905L/S905L3A 盒子刷 Linux/ROS2 镜像，替代树莓派/香橙派运行机器人建图、导航和 Web 中控台。"
+    if any(k.lower() in haystack for k in ["雷达", "lidar", "slam", "nav2", "rviz"]):
         return "低成本激光雷达接入 ROS2，并完成 SLAM 建图与 Nav2 导航验证。"
     keywords = extract_keywords(text, 8)
     return "围绕 " + "、".join(keywords[:5]) + " 展开。" if keywords else "主题需要结合视频画面进一步确认。"
@@ -2830,6 +2937,14 @@ def chapter_teaching_points(chapter: dict[str, Any], context: dict[str, Any]) ->
     text = chapter.get("text", "")
     lowered = text.lower()
     points: list[str] = []
+    if is_low_cost_ros_box_video(text):
+        if re.search(r"s905|树莓派|香橙派|cpu|内存|emmc|价格|淘宝|盒子", text, re.I):
+            points.append("这类方案的核心不是性能最强，而是用足够便宜的 ARM 盒子跑 Linux/ROS2，降低机器人学习和验证成本。")
+            points.append("选型时要看 CPU 架构、内存、存储、网口/USB、供电、散热和是否有可用镜像，不要只看价格。")
+        if re.search(r"刷机|镜像|u盘|优盘|emmc|安卓|linux|ssh", text, re.I):
+            points.append("复刻关键在镜像和启动方式：原安卓盒子要刷入 Linux/ROS2 镜像，启动后先通过 SSH 验证系统可控。")
+        if re.search(r"建图|导航|代价地图|web|中控|摇杆|视频流|地图", text, re.I):
+            points.append("跑 ROS2 成功不等于项目完成，还要验证 Web 中控台、建图、地图保存、地图加载和导航链路是否顺畅。")
     if re.search(r"雷达|lidar|usb|ttl|串口|供电", text, re.I):
         points.append("硬件重点是供电、通信接口和安装位置；便宜雷达能不能用，取决于能否稳定输出可被 ROS 使用的扫描数据。")
     if re.search(r"ros2|scan|tf|slam|toolbox|里程|odom|rviz", text, re.I):
@@ -2874,7 +2989,14 @@ def render_overview(context: dict[str, Any]) -> str:
         "## 你真正要学会的东西",
         "",
     ]
-    if any(re.search(r"雷达|lidar|ros2|slam|nav2|rviz|tf|scan", ch.get("text", ""), re.I) for ch in chapters):
+    if is_low_cost_ros_box_video(all_text + " " + source_label(metadata)):
+        lines += [
+            "- 判断低价 S905L/S905L3A 盒子是否适合跑 ROS2：CPU、内存、eMMC、USB、网络和价格。",
+            "- 理解刷机链路：原安卓系统 -> 写入 Linux/ROS2 镜像 -> 启动 -> SSH 登录。",
+            "- 验证 ROS2 运行能力：不是只开机，而是能跑建图、导航、Web 中控台、视频流和话题显示。",
+            "- 明白低成本方案的边界：适合学习和算法验证，不等于所有复杂机器人任务都够用。",
+        ]
+    elif any(re.search(r"雷达|lidar|ros2|slam|nav2|rviz|tf|scan", ch.get("text", ""), re.I) for ch in chapters):
         lines += [
             "- 低成本激光雷达如何接到机器人上：供电、串口/USB 转接、安装朝向。",
             "- ROS2 建图链路怎么跑通：雷达驱动发布 `/scan`，TF/里程计提供位姿关系，SLAM Toolbox 输出地图。",
