@@ -2,8 +2,9 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
-video-study-cases/
+video-study-cases*/
 work/
+tmp/
 *.mp4
 *.mov
 *.mkv

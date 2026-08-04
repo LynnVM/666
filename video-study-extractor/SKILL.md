@@ -1,13 +1,15 @@
 ---
 name: video-study-extractor
-description: Extract learning value from videos, audio files, subtitles, local folders, and platform links such as Bilibili, Douyin, Xiaohongshu, YouTube, and direct video URLs. Use when Codex needs to turn video lessons, screen recordings, talks, experiments, demos, short videos, or course folders into timestamped study packs with transcripts, keyframes, knowledge points, fact checks, corrections, quizzes, flashcards, and guided learning plans.
+description: 'Study videos, audio files, subtitles, local folders, and platform links such as Bilibili, Douyin, Xiaohongshu, YouTube, and direct video URLs, then teach the user interactively. Use when Codex needs to learn from video lessons, tutorials, screen recordings, experiments, demos, talks, short videos, or course folders and then act as a study-and-replication coach: extract transcripts/keyframes as backend evidence, explain the underlying knowledge, give step-by-step reproduction commands or checks, wait for user outputs, diagnose problems, and continue coaching. Also supports generating timestamped study packs, fact checks, quizzes, flashcards, and guided learning materials as supporting artifacts.'
 ---
 
 # Video Study Extractor
 
 ## Purpose
 
-Use this skill to make AI study a video before teaching the user. The goal is not a plain summary. The goal is a timestamped, evidence-backed study pack that combines speech, subtitles, frames, OCR/visual observations, and external fact checking.
+Use this skill to make AI study a video before teaching the user. The goal is not a plain summary and not a folder of documents as the final answer. The default user-facing outcome is an interactive study-and-replication session: explain the knowledge, convert the video into reproducible steps, give the next command/check, wait for the user's output, diagnose, and continue.
+
+Use the timestamped study pack as backend evidence for the AI teacher. The pack combines speech-to-text transcription, frames, OCR/visual observations, and external fact checking. For platform links, use the link to acquire permitted media, then transcribe the audio; platform subtitles are optional auxiliary evidence only.
 
 Default user-facing language: Chinese, unless the user asks otherwise.
 
@@ -20,7 +22,8 @@ Default user-facing language: Chinese, unless the user asks otherwise.
 
 2. Acquire media.
    - Prefer local files when provided.
-   - Prefer existing subtitles when available.
+   - For URLs/share text, acquire permitted media first so text can come from speech-to-text.
+   - Use existing subtitles only when the user explicitly provides them or asks to include platform subtitles.
    - For URLs, use platform adapters. See `references/platform-adapters.md` before handling platform-specific URLs.
    - Do not bypass DRM, paywalls, login-only content, or platform access controls.
    - If URL acquisition fails, ask for a local video file or subtitle file instead of pretending success.
@@ -32,8 +35,8 @@ Default user-facing language: Chinese, unless the user asks otherwise.
    - Process parts independently, then run `merge-parts` to create a course-level scaffold.
 
 4. Extract transcript.
-   - Prefer user-provided or platform-provided subtitles.
-   - Otherwise extract audio and transcribe with faster-whisper, whisper.cpp, cloud ASR, or the locally available toolchain.
+   - Default to extracting audio and transcribing with faster-whisper, whisper.cpp, cloud ASR, or the locally available toolchain.
+   - Treat user-provided or platform-provided subtitles as optional auxiliary evidence, not the default transcript source.
    - Keep timestamps. Produce text, SRT, and machine-readable segments when possible.
    - Run transcript cleaning before study-pack generation when subtitles or transcript segments are available.
 
@@ -60,7 +63,7 @@ Default user-facing language: Chinese, unless the user asks otherwise.
    - Mark unverified claims honestly. Do not invent citations.
    - Read `references/fact-checking.md` before producing a correction report.
 
-9. Produce the study pack.
+9. Produce the study pack as backend evidence.
    - Create timestamped outputs:
      - `00_overview.md`
      - `01_full_notes.md`
@@ -73,11 +76,15 @@ Default user-facing language: Chinese, unless the user asks otherwise.
      - `08_practice_checklist.md`
    - Use Chinese filenames only when the user asks; default to ASCII filenames for portability.
 
-10. Teach interactively.
-   - If the user asks to learn the video, teach one small section at a time.
-   - Ask 1-3 questions after each section.
-   - If the user answers incorrectly, explain using the relevant timestamp and correction notes.
-   - Do not merely repeat the notes; act as a study coach.
+10. Teach and replicate interactively.
+   - Read `references/coaching-mode.md` before starting chat-based coaching or reproduction guidance.
+   - Treat `study_pack/09_study_session.md` as the AI's private lesson plan, not as the final response.
+   - If the user asks to learn or reproduce the video, do not merely summarize or point to files.
+   - Start by stating: what the video ultimately reproduces, prerequisites, the overall principle chain, and the first small check/action.
+   - For each step, explain why the step matters, give exact commands or actions, say what output the user should send back, then wait.
+   - Diagnose the user's output before moving on.
+   - If the video is technical or practical, prioritize reproduction path, commands, environment checks, validation signs, common failures, and fixes.
+   - Ask 1-3 questions only when they help verify understanding or decide the next step.
 
 ## Quick Start
 
@@ -86,6 +93,16 @@ Check local dependencies first when setup is uncertain:
 ```powershell
 python <skill>/scripts/video_study_case.py doctor
 ```
+
+For the normal "user gives one video link, AI learns it and then coaches the user" workflow, prefer the one-command URL workflow:
+
+```powershell
+python <skill>/scripts/video_study_case.py study-url --input "https://www.bilibili.com/video/BV..." --out ".\video-study-cases" --download --transcribe --model small --language zh --device cpu --compute-type int8
+```
+
+This command should be the default for URL/share-text requests when media acquisition is permitted. It creates the case, acquires media, processes local media if available, transcribes speech, cleans the transcript, generates the backend study pack, exports the study-and-replication script, and validates the case. Use `--device cuda --compute-type float16` only when CUDA is installed and working. Add `--write-subs` only if the user explicitly wants platform subtitles as auxiliary evidence.
+
+After this command succeeds, read `study_pack/09_study_session.md` and start coaching in chat. Do not answer with only "files generated" unless the user explicitly asks for files.
 
 For a local video or folder, first create a case workspace:
 
@@ -105,13 +122,13 @@ For share text or a URL:
 python <skill>/scripts/video_study_case.py init --input "https://www.bilibili.com/video/BV..." --out ".\video-study-cases"
 ```
 
-For a URL/share-text case, try public subtitles first:
+For a URL/share-text case, acquire permitted media for ASR:
 
 ```powershell
-python <skill>/scripts/video_study_case.py acquire-url --case ".\video-study-cases\bilibili-xxxxxxxxxxxx"
+python <skill>/scripts/video_study_case.py acquire-url --case ".\video-study-cases\bilibili-xxxxxxxxxxxx" --download
 ```
 
-Use `--dry-run` to inspect the planned `yt-dlp` commands before acquisition. Use `--download` only when downloading the public media is permitted and subtitles are insufficient.
+Use `--dry-run` to inspect the planned `yt-dlp` commands before acquisition. Use `--write-subs` only when platform subtitles are explicitly requested as auxiliary evidence.
 
 Then process local media when the case contains a local video or audio file:
 
@@ -211,10 +228,10 @@ After acquisition or processing, read `metadata.json`, relevant reports such as 
 - If environment setup is uncertain, run `doctor` before media processing.
 - If the case state is unclear, run `next-steps` and follow the highest-priority command.
 - If generated outputs look incomplete, run `validate-case` and address warnings/errors.
-- If the user wants to learn interactively, run `export-study-session` after notes and fact-check queue are generated.
+- If the user wants to learn interactively or reproduce what the video teaches, run `export-study-session` after notes and fact-check queue are generated, then start the first coaching step in chat.
 - If the user wants fewer manual commands, run `run-pipeline --dry-run` first, then run without `--dry-run` only for safe offline steps.
 - If local media is longer than 60 minutes, split it before final study-pack generation unless the user explicitly wants one large case.
-- If the video has subtitles, use them first but still sample frames because visual content may contain important details not spoken aloud.
+- If the video has subtitles, keep them as auxiliary evidence but still generate the main transcript from speech unless the user asks otherwise.
 - If subtitles are too fragmented or noisy, run `clean-transcript` before generating notes.
 - If keyframes exist, run `frame-notes` and fill visual observations before finalizing notes.
 - If transcript and visual evidence conflict, surface the conflict.
@@ -227,5 +244,6 @@ After acquisition or processing, read `metadata.json`, relevant reports such as 
 - `scripts/video_study_case.py`: Check dependencies, create case workspaces, validate case completeness, batch-create cases from folders, classify inputs, extract URLs from share text, acquire public subtitles/media with `yt-dlp` when available, recommend next commands, generate processing plans, run or preview offline pipeline steps, split long local media into part cases, merge processed part cases, extract local audio, extract uniform and scene-change keyframes, optionally transcribe with faster-whisper, clean transcript segments, generate chapter JSON, create frame-observation worksheets, create study-pack templates, generate first-pass study packs, create fact-check queues, export interactive study sessions, run an offline self-test fixture, and extract claim candidates for fact checking.
 - `references/platform-adapters.md`: Platform adapter strategy and fallback behavior for local files, Bilibili, Douyin, Xiaohongshu, YouTube, and generic URLs.
 - `references/output-templates.md`: Required study pack structure and formatting.
+- `references/coaching-mode.md`: Chat-based teaching and reproduction loop for turning studied videos into step-by-step coaching.
 - `references/fact-checking.md`: Claim extraction, source priority, correction report rules.
 - `references/troubleshooting.md`: Common failures and fallback actions.

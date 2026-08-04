@@ -1,8 +1,10 @@
 # video-study-extractor
 
-AI video study coach for Codex skills.
+AI video study-and-replication coach for Codex skills.
 
-This project turns videos, audio files, subtitles, folders, and platform links into timestamped study packs. It is designed for learning, not just summarization: the AI extracts transcripts and keyframes, understands the lesson structure, checks important claims, and then teaches the learner with notes, quizzes, flashcards, and guided learning plans.
+This project helps an AI study videos, audio files, subtitles, folders, and platform links, then teach the learner interactively. The intended result is not just a summary or a folder of Markdown files: the AI should understand the lesson, explain the principles, convert the video into a reproduction path, give the learner one command/check at a time, diagnose the learner's output, and continue coaching.
+
+The generated study pack is backend evidence for the AI teacher. It contains timestamps, transcripts, keyframes, knowledge points, fact-check queues, quizzes, flashcards, and practice checklists, but the main user experience should be conversational coaching.
 
 ## What It Supports
 
@@ -12,11 +14,11 @@ This project turns videos, audio files, subtitles, folders, and platform links i
 - Local folders containing multiple videos.
 - Platform URLs and share text from sites such as Bilibili, Douyin, Xiaohongshu, YouTube, and direct video URLs.
 
-Platform links are handled with adapters and fallbacks. If a platform link cannot be accessed reliably or lawfully, provide a local downloaded video or subtitle file.
+Platform links are handled with adapters and fallbacks. The normal workflow uses the link to acquire permitted media, then generates text with speech-to-text transcription. Platform subtitles are optional auxiliary evidence only. If a platform link cannot be accessed reliably or lawfully, provide a local downloaded video file.
 
-## Study Pack Outputs
+## Backend Study Pack Outputs
 
-The skill aims to produce:
+The skill can produce these supporting files:
 
 - `00_overview.md`
 - `01_full_notes.md`
@@ -27,6 +29,9 @@ The skill aims to produce:
 - `06_flashcards.md`
 - `07_guided_learning_plan.md`
 - `08_practice_checklist.md`
+- `09_study_session.md`
+
+For interactive learning, start from `09_study_session.md`, then teach in chat instead of handing the user the files as the final answer.
 
 ## Compliance
 
@@ -43,7 +48,7 @@ Copy-Item -Recurse -LiteralPath .\video-study-extractor -Destination "$env:USERP
 Then invoke it with prompts like:
 
 ```text
-Use $video-study-extractor to study this video: D:\Videos\lesson.mp4
+Use $video-study-extractor to study this video, explain the principles, and guide me step by step to reproduce it: D:\Videos\lesson.mp4
 ```
 
 ## Current Status
@@ -57,8 +62,8 @@ This repository is still early, but it now contains a usable local-media pipelin
 - Extract 16 kHz mono WAV audio from local videos.
 - Extract timestamped uniform and scene-change keyframes from local videos.
 - Optionally transcribe audio with `faster-whisper`.
-- Acquire public subtitles from URL/share-text cases with `yt-dlp` when available.
-- Optionally acquire permitted public media from URL/share-text cases.
+- Acquire permitted public media from URL/share-text cases with `yt-dlp` when available.
+- Generate the main transcript from speech-to-text rather than relying on platform subtitles.
 - Plan and optionally execute long-video splitting into smaller part cases.
 - Merge processed part cases into a course-level study pack scaffold.
 - Clean SRT/VTT/TXT transcripts, merge overly short captions, and generate chapter JSON.
@@ -72,7 +77,7 @@ This repository is still early, but it now contains a usable local-media pipelin
 - Preview or run the offline case pipeline with one command.
 - Generate `metadata.json`, `study_plan.md`, `keyframes/keyframes.json`, `transcript/`, `reports/process_local.json`, and `study_pack/`.
 
-Platform URL acquisition is best-effort. It uses `yt-dlp` when available, tries public subtitles first, and can optionally download permitted public media. For Bilibili, Douyin, Xiaohongshu, and similar sites, the most reliable fallback is still a local downloaded video or subtitle file.
+Platform URL acquisition is best-effort. It uses `yt-dlp` when available to download permitted public media for speech-to-text transcription. For Bilibili, Douyin, Xiaohongshu, and similar sites, the most reliable fallback is still a local downloaded video file.
 
 ## Dependencies
 
@@ -101,6 +106,28 @@ pip install yt-dlp
 ```
 
 If you already have `ffmpeg` and `ffprobe` on PATH, the script will use them. If system `ffmpeg` is missing, it tries `imageio-ffmpeg` for extraction. Media probing still needs `ffprobe`.
+
+## One-Command URL Study And Coaching
+
+For the normal "give AI one video link, let it study the video, then coach the learner" workflow, use `study-url`.
+
+```powershell
+python .\video-study-extractor\scripts\video_study_case.py study-url --input "https://www.bilibili.com/video/BV..." --out ".\video-study-cases" --download --transcribe --model small --language zh --device cpu --compute-type int8
+```
+
+This command creates a case, acquires permitted media, extracts audio and keyframes, transcribes speech, cleans the transcript, generates the backend study pack, exports an AI-guided replication script, and validates the case.
+
+The final files are printed at the end. For interactive coaching, the AI should read:
+
+- `study_pack/09_study_session.md`
+
+Then it should start the first reproduction step in chat: explain the goal, prerequisites, principle chain, first command/check, and what output the learner should send back.
+
+Use CPU by default on Windows because it is reliable without CUDA. If CUDA is installed correctly, use:
+
+```powershell
+python .\video-study-extractor\scripts\video_study_case.py study-url --input "https://www.bilibili.com/video/BV..." --out ".\video-study-cases" --download --transcribe --model small --language zh --device cuda --compute-type float16
+```
 
 ## Local Video Pipeline
 
@@ -134,16 +161,16 @@ Check what acquisition would run:
 python .\video-study-extractor\scripts\video_study_case.py acquire-url --case ".\video-study-cases\bilibili-xxxxxxxxxxxx" --dry-run
 ```
 
-Try public subtitles first:
-
-```powershell
-python .\video-study-extractor\scripts\video_study_case.py acquire-url --case ".\video-study-cases\bilibili-xxxxxxxxxxxx"
-```
-
-Optionally download permitted public media:
+Acquire permitted public media for speech-to-text:
 
 ```powershell
 python .\video-study-extractor\scripts\video_study_case.py acquire-url --case ".\video-study-cases\bilibili-xxxxxxxxxxxx" --download
+```
+
+Only request platform subtitles as optional auxiliary evidence:
+
+```powershell
+python .\video-study-extractor\scripts\video_study_case.py acquire-url --case ".\video-study-cases\bilibili-xxxxxxxxxxxx" --download --write-subs
 ```
 
 The script prints the created case directory. Then process local media:

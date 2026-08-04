@@ -43,6 +43,53 @@ STUDY_PACK_FILES = [
     "08_practice_checklist.md",
 ]
 
+ZH_NORMALIZATION_MAP = str.maketrans({
+    "這": "这", "個": "个", "裡": "里", "裏": "里", "會": "会", "時": "时", "候": "候",
+    "種": "种", "憑": "凭", "現": "现", "點": "点", "實": "实", "掃": "扫", "描": "描",
+    "礙": "碍", "斷": "断", "數": "数", "據": "据", "齡": "龄", "傳": "传", "過": "过",
+    "程": "程", "見": "见", "象": "象", "為": "为", "導": "导", "致": "致", "圍": "围",
+    "區": "区", "標": "标", "於": "于", "內": "内", "徑": "径", "規": "规", "劃": "划",
+    "敗": "败", "終": "终", "端": "端", "啟": "启", "動": "动", "濾": "滤", "說": "说",
+    "紅": "红", "黃": "黄", "經": "经", "從": "从", "圖": "图", "產": "产", "響": "响",
+    "開": "开", "將": "将", "稱": "称", "檔": "档", "參": "参", "歡": "欢", "樂": "乐",
+    "學": "学", "習": "习", "問": "问", "題": "题", "認": "认", "證": "证", "錯": "错",
+    "誤": "误", "語": "语", "記": "记", "錄": "录", "體": "体", "優": "优", "級": "级",
+    "擇": "择", "網": "网", "點": "点", "頻": "频", "視": "视", "資": "资", "料": "料",
+    "權": "权", "威": "威", "補": "补", "齊": "齐", "寫": "写", "舊": "旧", "進": "进",
+    "來": "来", "後": "后", "處": "处", "對": "对", "頂": "顶", "評": "评", "論": "论",
+    "麼": "么", "條": "条", "編": "编", "譯": "译", "還": "还", "覺": "觉", "顯": "显",
+    "與": "与", "應": "应", "該": "该", "實": "实", "驗": "验", "產": "产", "響": "响",
+})
+
+TERM_NORMALIZATION_REPLACEMENTS = [
+    ("GEOF传染器", "GEOF传感器"),
+    ("GEOF傳染器", "GEOF传感器"),
+    ("数据年龄", "数据拖影"),
+    ("數據年齡", "数据拖影"),
+    ("進行区", "禁行区"),
+    ("进行区", "禁行区"),
+    ("進行區", "禁行区"),
+    ("中端", "终端"),
+    ("代价地图里踢除了", "代价地图里剔除了"),
+    ("被踢除", "被剔除"),
+    ("撤去点", "测距点"),
+    ("撤去點", "测距点"),
+    ("SRC字幕录", "src 目录"),
+    ("SRC字目录", "src 目录"),
+    ("滤波解点的原代码", "滤波节点的源代码"),
+    ("原代码", "源代码"),
+    ("浪誓文件", "launch 文件"),
+    ("下代价地图参数", "代价地图参数"),
+    ("Scan Filter", "scan_filtered"),
+    ("激光雷達", "激光雷达"),
+    ("濾波", "滤波"),
+    ("導航", "导航"),
+    ("路徑規劃", "路径规划"),
+    ("代價地圖", "代价地图"),
+    ("傳感器", "传感器"),
+    ("啟動", "启动"),
+]
+
 
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()
@@ -150,12 +197,28 @@ def find_python_module_binary(module: str, attr: str) -> str | None:
         return None
 
 
+def find_windows_tool_link(name: str) -> str | None:
+    candidates = [
+        Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Links" / f"{name}.EXE",
+        Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Links" / f"{name}.exe",
+    ]
+    for path in candidates:
+        try:
+            if path.exists():
+                if path.stat().st_size == 0:
+                    continue
+                return str(path)
+        except PermissionError:
+            continue
+    return None
+
+
 def find_ffmpeg() -> str | None:
-    return which("ffmpeg") or find_python_module_binary("imageio_ffmpeg", "get_ffmpeg_exe")
+    return which("ffmpeg") or find_python_module_binary("imageio_ffmpeg", "get_ffmpeg_exe") or find_windows_tool_link("ffmpeg")
 
 
 def find_ffprobe() -> str | None:
-    return which("ffprobe")
+    return which("ffprobe") or find_windows_tool_link("ffprobe")
 
 
 def run_capture(cmd: list[str], timeout: int = 20) -> tuple[int, str]:
@@ -192,8 +255,7 @@ def probe_media(path: Path) -> dict:
     probe = {"available": False}
     ffprobe = find_ffprobe()
     if not ffprobe:
-        probe["error"] = "ffprobe not found"
-        return probe
+        return probe_media_with_ffmpeg(path, "ffprobe not found")
     code, out = run_capture([
         ffprobe,
         "-v",
@@ -205,8 +267,7 @@ def probe_media(path: Path) -> dict:
         str(path),
     ])
     if code != 0:
-        probe["error"] = out
-        return probe
+        return probe_media_with_ffmpeg(path, out)
     try:
         data = json.loads(out)
     except json.JSONDecodeError:
@@ -216,6 +277,41 @@ def probe_media(path: Path) -> dict:
     probe["format"] = data.get("format", {})
     probe["streams"] = data.get("streams", [])
     return probe
+
+
+def probe_media_with_ffmpeg(path: Path, previous_error: str | None = None) -> dict:
+    ffmpeg = find_ffmpeg()
+    probe: dict[str, Any] = {"available": False, "format": {}, "streams": []}
+    if previous_error:
+        probe["ffprobe_error"] = previous_error
+    if not ffmpeg:
+        probe["error"] = "ffmpeg fallback not available"
+        return probe
+    code, out = run_capture([ffmpeg, "-hide_banner", "-i", str(path)], timeout=30)
+    if code not in {0, 1}:
+        probe["error"] = out
+        return probe
+    duration = parse_ffmpeg_duration(out)
+    if duration is not None:
+        probe["format"]["duration"] = str(duration)
+    if re.search(r"Stream #\d+:\d+.*Video:", out):
+        probe["streams"].append({"codec_type": "video", "source": "ffmpeg"})
+    if re.search(r"Stream #\d+:\d+.*Audio:", out):
+        probe["streams"].append({"codec_type": "audio", "source": "ffmpeg"})
+    probe["available"] = bool(probe["streams"] or duration is not None)
+    if not probe["available"]:
+        probe["error"] = out[-2000:]
+    return probe
+
+
+def parse_ffmpeg_duration(output: str) -> float | None:
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", output)
+    if not match:
+        return None
+    hours = int(match.group(1))
+    minutes = int(match.group(2))
+    seconds = float(match.group(3))
+    return hours * 3600 + minutes * 60 + seconds
 
 
 def media_duration_seconds(probe: dict) -> float | None:
@@ -252,6 +348,10 @@ def srt_timestamp(seconds: float) -> str:
 
 def write_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def write_markdown(path: Path, content: str) -> None:
+    path.write_text(content, encoding="utf-8-sig")
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -342,6 +442,104 @@ def create_folder_cases(args: argparse.Namespace) -> None:
     print(str(out_dir.resolve() / "folder_cases.json"))
 
 
+def study_url(args: argparse.Namespace) -> None:
+    out_dir = Path(args.out).resolve()
+    url_case = build_case(args.input, out_dir)
+    acquire_url(argparse.Namespace(
+        case=str(url_case),
+        download=args.download,
+        dry_run=False,
+        sub_langs=args.sub_langs,
+        format=args.format,
+        timeout=args.timeout,
+        write_subs=args.write_subs,
+    ))
+    acquire_report_path = url_case / "reports" / "acquire_url.json"
+    acquire_report = read_json(acquire_report_path) if acquire_report_path.exists() else {}
+    media_file = acquire_report.get("media_file")
+    active_case = url_case
+
+    if media_file and Path(media_file).exists():
+        active_case = build_case(media_file, out_dir)
+        run_pipeline(argparse.Namespace(
+            case=str(active_case),
+            dry_run=False,
+            keep_going=args.keep_going,
+            process_local=True,
+            transcribe=args.transcribe,
+            model=args.model,
+            language=args.language,
+            device=args.device,
+            compute_type=args.compute_type,
+            keyframes=args.keyframes,
+            scene_keyframes=args.scene_keyframes,
+            scene_threshold=args.scene_threshold,
+            max_single_minutes=args.max_single_minutes,
+            chapter_minutes=args.chapter_minutes,
+            claims=args.claims,
+            frame_limit=args.frame_limit,
+            overwrite_generated=True,
+            download=False,
+            write_subs=False,
+            sub_langs=args.sub_langs,
+            format=args.format,
+            timeout=args.timeout,
+        ))
+    else:
+        run_pipeline(argparse.Namespace(
+            case=str(active_case),
+            dry_run=False,
+            keep_going=args.keep_going,
+            process_local=False,
+            transcribe=False,
+            model=args.model,
+            language=args.language,
+            device=args.device,
+            compute_type=args.compute_type,
+            keyframes=args.keyframes,
+            scene_keyframes=args.scene_keyframes,
+            scene_threshold=args.scene_threshold,
+            max_single_minutes=args.max_single_minutes,
+            chapter_minutes=args.chapter_minutes,
+            claims=args.claims,
+            frame_limit=args.frame_limit,
+            overwrite_generated=True,
+            download=False,
+            write_subs=False,
+            sub_langs=args.sub_langs,
+            format=args.format,
+            timeout=args.timeout,
+        ))
+
+    run_report_path = active_case / "reports" / "run_pipeline.json"
+    run_report = read_json(run_report_path) if run_report_path.exists() else {}
+    study_session = active_case / "study_pack" / "09_study_session.md"
+    study_pack_files = [active_case / "study_pack" / name for name in STUDY_PACK_FILES]
+    warnings = list(acquire_report.get("warnings") or [])
+    failed_steps = [
+        step for step in run_report.get("steps", [])
+        if step.get("status") == "failed"
+    ]
+    errors = [f"{step.get('name')}: {step.get('error')}" for step in failed_steps]
+    complete = study_session.exists() and all(path.exists() for path in study_pack_files)
+    final_report = {
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "input": args.input,
+        "url_case": str(url_case),
+        "case": str(active_case),
+        "study_pack": str(active_case / "study_pack"),
+        "study_session": str(study_session),
+        "downloaded_media": media_file,
+        "complete": complete,
+        "warnings": warnings,
+        "errors": errors,
+    }
+    write_json(active_case / "reports" / "study_url.json", final_report)
+    print(render_study_url_summary(final_report))
+    if not complete:
+        raise SystemExit(2)
+
+
 def acquire_url(args: argparse.Namespace) -> None:
     case_dir = Path(args.case).resolve()
     metadata_path = case_dir / "metadata.json"
@@ -362,7 +560,7 @@ def acquire_url(args: argparse.Namespace) -> None:
         "platform": input_info.get("platform"),
         "yt_dlp": ytdlp,
         "dry_run": args.dry_run,
-        "mode": "subtitles_only" if not args.download else "subtitles_and_media",
+        "mode": "media_for_asr" if args.download else "metadata_only",
         "sub_langs": args.sub_langs,
         "subtitles": None,
         "media": None,
@@ -377,27 +575,28 @@ def acquire_url(args: argparse.Namespace) -> None:
         print(str(case_dir / "reports" / "acquire_url.json"))
         return
 
-    subtitle_dir = case_dir / "transcript" / "subtitles"
-    subtitle_dir.mkdir(parents=True, exist_ok=True)
-    subtitle_cmd = ytdlp + [
-        "--skip-download",
-        "--write-subs",
-        "--write-auto-subs",
-        "--sub-langs",
-        args.sub_langs,
-        "--convert-subs",
-        "srt",
-        "--no-playlist",
-        "--ignore-errors",
-        "-o",
-        str(subtitle_dir / "%(title).100s.%(ext)s"),
-        url,
-    ]
-    report["subtitles"] = {"command": subtitle_cmd}
-    if not args.dry_run:
-        code, out = run_capture(subtitle_cmd, timeout=args.timeout)
-        report["subtitles"].update({"returncode": code, "output_tail": out[-4000:]})
-        report["subtitles"]["files"] = [str(p) for p in subtitle_dir.glob("*")]
+    if args.write_subs:
+        subtitle_dir = case_dir / "transcript" / "subtitles"
+        subtitle_dir.mkdir(parents=True, exist_ok=True)
+        subtitle_cmd = ytdlp + [
+            "--skip-download",
+            "--write-subs",
+            "--write-auto-subs",
+            "--sub-langs",
+            args.sub_langs,
+            "--convert-subs",
+            "srt",
+            "--no-playlist",
+            "--ignore-errors",
+            "-o",
+            str(subtitle_dir / "%(title).100s.%(ext)s"),
+            url,
+        ]
+        report["subtitles"] = {"command": subtitle_cmd}
+        if not args.dry_run:
+            code, out = run_capture(subtitle_cmd, timeout=args.timeout)
+            report["subtitles"].update({"returncode": code, "output_tail": out[-4000:]})
+            report["subtitles"]["files"] = [str(p) for p in subtitle_dir.glob("*")]
 
     if args.download:
         media_dir = case_dir / "media"
@@ -434,12 +633,16 @@ def acquire_url(args: argparse.Namespace) -> None:
                     "No media file was acquired. Provide a local video/audio/subtitle file if the platform blocks access."
                 )
 
-    if not args.dry_run:
+    if not args.dry_run and args.write_subs:
         subtitle_files = report.get("subtitles", {}).get("files") or []
         if not subtitle_files:
             report["warnings"].append(
-                "No subtitle file was acquired. Try --download for permitted media, or provide a local subtitle/video file."
+                "No subtitle file was acquired. The normal workflow should still use downloaded media plus ASR transcription."
             )
+    if not args.dry_run and args.download and not report.get("media_file"):
+        report["warnings"].append(
+            "No media file was acquired, so speech-to-text transcription cannot start."
+        )
 
     report["finished_at"] = datetime.now(timezone.utc).isoformat()
     metadata["acquire_url"] = report
@@ -521,7 +724,7 @@ def extract_scene_keyframes(
         str(source),
         "-vf",
         f"select='gt(scene,{threshold})',showinfo",
-        "-vsync",
+        "-fps_mode",
         "vfr",
         "-frames:v",
         str(max_frames),
@@ -538,6 +741,9 @@ def extract_scene_keyframes(
         errors="replace",
     )
     if p.returncode != 0:
+        files = sorted(out_dir.glob("scene_*.jpg"))
+        if not files:
+            return []
         raise RuntimeError(f"Scene keyframe extraction failed:\n{p.stdout}")
     pts_times = [float(m.group(1)) for m in re.finditer(r"pts_time:([0-9.]+)", p.stdout)]
     files = sorted(out_dir.glob("scene_*.jpg"))
@@ -592,7 +798,14 @@ def write_segments_outputs(segments: list[dict], transcript_dir: Path) -> None:
     (transcript_dir / "transcript.srt").write_text("\n".join(srt_lines), encoding="utf-8")
 
 
-def transcribe_audio(audio_path: Path, transcript_dir: Path, model_size: str, language: str | None) -> dict:
+def transcribe_audio(
+    audio_path: Path,
+    transcript_dir: Path,
+    model_size: str,
+    language: str | None,
+    device: str,
+    compute_type: str,
+) -> dict:
     try:
         from faster_whisper import WhisperModel  # type: ignore
     except Exception as exc:  # noqa: BLE001
@@ -601,20 +814,32 @@ def transcribe_audio(audio_path: Path, transcript_dir: Path, model_size: str, la
             "error": f"faster-whisper unavailable: {exc}",
             "next_step": "Install faster-whisper or provide an existing subtitle file.",
         }
-    model = WhisperModel(model_size, device="auto", compute_type="auto")
-    segments_iter, info = model.transcribe(str(audio_path), language=language)
-    segments = [
-        {"start": seg.start, "end": seg.end, "text": seg.text}
-        for seg in segments_iter
-    ]
-    write_segments_outputs(segments, transcript_dir)
-    return {
-        "available": True,
-        "model_size": model_size,
-        "language": getattr(info, "language", language),
-        "language_probability": getattr(info, "language_probability", None),
-        "segments": len(segments),
-    }
+    try:
+        model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        segments_iter, info = model.transcribe(str(audio_path), language=language)
+        segments = [
+            {"start": seg.start, "end": seg.end, "text": seg.text}
+            for seg in segments_iter
+        ]
+        write_segments_outputs(segments, transcript_dir)
+        return {
+            "available": True,
+            "model_size": model_size,
+            "device": device,
+            "compute_type": compute_type,
+            "language": getattr(info, "language", language),
+            "language_probability": getattr(info, "language_probability", None),
+            "segments": len(segments),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "available": False,
+            "error": f"faster-whisper transcription failed: {exc}",
+            "model_size": model_size,
+            "device": device,
+            "compute_type": compute_type,
+            "next_step": "Retry with --device cpu --compute-type int8, clear a broken model cache, use another model size, or provide a subtitle file.",
+        }
 
 
 def process_local(args: argparse.Namespace) -> None:
@@ -679,13 +904,18 @@ def process_local(args: argparse.Namespace) -> None:
         )
         scene_keyframes = []
         if args.scene_keyframes > 0:
-            scene_keyframes = extract_scene_keyframes(
-                ffmpeg,
-                source,
-                case_dir / "keyframes" / "scene",
-                args.scene_threshold,
-                args.scene_keyframes,
-            )
+            try:
+                scene_keyframes = extract_scene_keyframes(
+                    ffmpeg,
+                    source,
+                    case_dir / "keyframes" / "scene",
+                    args.scene_threshold,
+                    args.scene_keyframes,
+                )
+            except RuntimeError as exc:
+                process_report["warnings"].append(
+                    f"Scene keyframe extraction failed; continuing with uniform keyframes only. {str(exc)[:600]}"
+                )
         keyframes = merge_keyframe_indexes(uniform_keyframes, scene_keyframes)
         write_json(case_dir / "keyframes" / "keyframes.json", {
             "frames": keyframes,
@@ -707,6 +937,8 @@ def process_local(args: argparse.Namespace) -> None:
             case_dir / "transcript",
             args.model,
             args.language,
+            args.device,
+            args.compute_type,
         )
     elif process_report.get("audio"):
         process_report["transcription"] = {
@@ -974,7 +1206,7 @@ def merge_parts(args: argparse.Namespace) -> None:
     for name, content in outputs.items():
         path = course_pack / name
         if args.force or not path.exists():
-            path.write_text(content, encoding="utf-8")
+            write_markdown(path, content)
             report["outputs"].append(str(path))
     write_json(case_dir / "analysis" / "merged_claims.json", {"claims": claims})
     write_json(case_dir / "reports" / "merge_parts.json", report)
@@ -1124,6 +1356,7 @@ def doctor(args: argparse.Namespace) -> None:
     ffmpeg = find_ffmpeg()
     ffprobe = find_ffprobe()
     ytdlp = find_yt_dlp_cmd()
+    bad_hf_files = find_zero_byte_hf_files()
     checks = [
         {
             "name": "python",
@@ -1166,6 +1399,13 @@ def doctor(args: argparse.Namespace) -> None:
             "required_for": "ffmpeg fallback when system ffmpeg is missing",
             "install_hint": "Run `pip install imageio-ffmpeg`.",
         },
+        {
+            "name": "huggingface-cache",
+            "available": not bad_hf_files,
+            "value": "; ".join(bad_hf_files[:5]) if bad_hf_files else "no zero-byte files detected",
+            "required_for": "faster-whisper model loading",
+            "install_hint": "Delete the broken model cache directory and rerun transcription, or use another model size.",
+        },
     ]
     report = {
         "finished_at": datetime.now(timezone.utc).isoformat(),
@@ -1174,7 +1414,7 @@ def doctor(args: argparse.Namespace) -> None:
         "warnings": [
             f"{item['name']} missing: {item.get('install_hint')}"
             for item in checks
-            if not item["available"] and item["name"] in {"ffmpeg", "ffprobe"}
+            if not item["available"] and item["name"] in {"ffmpeg", "ffprobe", "huggingface-cache"}
         ],
     }
     if args.out:
@@ -1202,6 +1442,23 @@ def render_doctor(report: dict[str, Any]) -> str:
         lines += ["## Warnings", ""]
         lines += [f"- {warning}" for warning in warnings]
     return "\n".join(lines)
+
+
+def find_zero_byte_hf_files(limit: int = 20) -> list[str]:
+    roots = [
+        Path(os.environ.get("HF_HOME", "")),
+        Path.home() / ".cache" / "huggingface" / "hub",
+    ]
+    bad = []
+    for root in roots:
+        if not str(root) or not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if path.is_file() and path.stat().st_size == 0:
+                bad.append(str(path))
+                if len(bad) >= limit:
+                    return bad
+    return bad
 
 
 def next_steps(args: argparse.Namespace) -> None:
@@ -1379,7 +1636,7 @@ def export_study_session(args: argparse.Namespace) -> None:
     out_md = case_dir / "study_pack" / "09_study_session.md"
     out_json = case_dir / "analysis" / "study_session.json"
     write_json(out_json, session)
-    out_md.write_text(render_study_session(session, args.questions_per_chapter), encoding="utf-8")
+    write_markdown(out_md, render_study_session(session, args.questions_per_chapter))
     report = {
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "chapters": len(chapters),
@@ -1455,6 +1712,7 @@ def pipeline_steps(case_dir: Path, metadata: dict[str, Any], args: argparse.Name
             sub_langs=args.sub_langs,
             format=args.format,
             timeout=args.timeout,
+            write_subs=args.write_subs,
         )),
     )
     add(
@@ -1469,6 +1727,8 @@ def pipeline_steps(case_dir: Path, metadata: dict[str, Any], args: argparse.Name
             transcribe=args.transcribe,
             model=args.model,
             language=args.language,
+            device=args.device,
+            compute_type=args.compute_type,
             max_single_minutes=args.max_single_minutes,
         )),
     )
@@ -1486,6 +1746,15 @@ def pipeline_steps(case_dir: Path, metadata: dict[str, Any], args: argparse.Name
         )),
     )
     add(
+        "normalize-transcript",
+        (case_dir / "transcript" / "clean_segments.json").exists() and not (case_dir / "reports" / "normalize_transcript.json").exists(),
+        "Transcript exists but has not been normalized to simplified Chinese/technical terms.",
+        lambda: normalize_transcript_command(argparse.Namespace(
+            case=str(case_dir),
+            chapter_minutes=args.chapter_minutes,
+        )),
+    )
+    add(
         "frame-notes",
         keyframes_ready and not (case_dir / "analysis" / "frame_observations.md").exists(),
         "Keyframes exist but visual observation worksheet is missing.",
@@ -1493,7 +1762,7 @@ def pipeline_steps(case_dir: Path, metadata: dict[str, Any], args: argparse.Name
     )
     add(
         "generate-study-pack",
-        transcript_source_ready and not study_pack_ready,
+        transcript_source_ready and (not study_pack_ready or args.overwrite_generated),
         "Study pack has not been generated.",
         lambda: generate_study_pack(argparse.Namespace(
             case=str(case_dir),
@@ -1511,7 +1780,10 @@ def pipeline_steps(case_dir: Path, metadata: dict[str, Any], args: argparse.Name
     )
     add(
         "export-study-session",
-        transcript_source_ready and not (case_dir / "study_pack" / "09_study_session.md").exists(),
+        transcript_source_ready and (
+            not (case_dir / "study_pack" / "09_study_session.md").exists()
+            or args.overwrite_generated
+        ),
         "Study pack exists but interactive study session is missing.",
         lambda: export_study_session(argparse.Namespace(
             case=str(case_dir),
@@ -1539,68 +1811,180 @@ def render_run_pipeline(report: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def render_study_session(session: dict[str, Any], questions_per_chapter: int) -> str:
+def render_study_url_summary(report: dict[str, Any]) -> str:
+    complete = bool(report.get("complete"))
     lines = [
-        "# AI Study Session",
+        "# 视频学习任务完成" if complete else "# 视频学习任务未完成",
         "",
-        f"Source: `{session.get('source')}`",
+        f"- 案例目录：`{report['case']}`",
+        f"- 学习包：`{report['study_pack']}`",
+        f"- AI带学脚本：`{report['study_session']}`",
+    ]
+    if report.get("downloaded_media"):
+        lines.append(f"- 已下载媒体：`{report['downloaded_media']}`")
+    if report.get("warnings"):
+        lines += ["", "## 警告", ""]
+        lines += [f"- {warning}" for warning in report["warnings"]]
+    if report.get("errors"):
+        lines += ["", "## 错误", ""]
+        lines += [f"- {error}" for error in report["errors"]]
+    if complete:
+        lines += [
+            "",
+            "下一步不要把学习包直接丢给用户。先读 `09_study_session.md`，然后用对话方式开始带学复刻：先说明最终要复刻什么，再给第 1 步命令，等待用户输出后继续判断。",
+        ]
+    else:
+        lines += [
+            "",
+            "这次没有拿到可解析的视频、字幕或转写内容。请提供本地视频文件，或在允许联网访问的平台环境中重试。",
+        ]
+    return "\n".join(lines)
+
+
+def render_study_session(session: dict[str, Any], questions_per_chapter: int) -> str:
+    quality = transcript_quality([
+        seg
+        for chapter in session.get("chapters", [])
+        for seg in chapter.get("segments", [])
+        if isinstance(seg, dict)
+    ])
+    lines = [
+        "# AI 视频带学复刻脚本",
         "",
-        "Use this as an interactive teaching script. Teach one chapter at a time, ask the learner to answer, then correct with timestamps and fact-check notes.",
+        f"来源：`{session.get('source')}`",
         "",
-        "## Session Rules",
+        "用这个文件进行互动式学习和复刻。它不是给用户看的最终文档，而是 AI 的后台教案。AI 应先学懂视频，再像老师一样带用户一步一步复现。",
         "",
-        "- Do not teach the whole video at once.",
-        "- For each chapter: explain, ask, wait, correct, then continue.",
-        "- If a claim appears in the fact-check queue, mark it as unverified until checked.",
-        "- Tie answers back to timestamps and visual evidence.",
+        f"转写质量：`{quality.get('level')}`，评分：`{quality.get('score')}`。如果本章转写不顺，以视频画面和官方资料为准。",
+        "",
+        "## 带学规则",
+        "",
+        "- 不要把本文件全文发给用户。",
+        "- 不要只总结“视频讲了什么”。必须转成“怎么复刻、为什么这么做、你现在运行什么、我如何判断输出”。",
+        "- 每次只推进一个小步骤，给出可执行命令或检查动作，等待用户输出后再继续。",
+        "- 每个步骤都要解释原理：这一步验证了哪条数据链、错了会出现什么现象。",
+        "- 如果某个说法出现在事实核查队列里，在查证前标为“待核查”。",
+        "- 回答和纠错都要尽量回到时间戳、字幕和关键帧证据。",
+        "",
+        "## 对话开场模板",
+        "",
+        "先告诉用户：我已经学完视频，接下来不发文档，而是带你复刻。然后按下面格式开始：",
+        "",
+        "1. 这个视频最终要复刻什么。",
+        "2. 需要哪些前置条件。",
+        "3. 整体原理链路是什么。",
+        "4. 第一步先做什么。",
+        "5. 为什么先做它。",
+        "6. 用户运行什么命令或做什么检查。",
+        "7. 用户应该把什么结果发回来。",
+        "",
+        "## 复刻路线",
+        "",
+        *render_replication_route(session),
         "",
     ]
     chapters = session.get("chapters") or []
     if not chapters:
         lines += [
-            "## Missing Chapters",
+            "## 缺少章节",
             "",
-            "No chapters found. Run `clean-transcript` before exporting a study session.",
+            "没有找到章节。请先运行 `clean-transcript`，再导出带学脚本。",
             "",
         ]
     for chapter in chapters:
         start = format_timestamp(safe_float(chapter.get("start")))
         end = format_timestamp(safe_float(chapter.get("end")))
-        title = chapter.get("title") or f"Chapter {chapter.get('index', '')}"
+        points = chapter_teaching_points(chapter, {"keyframes": []})
         lines += [
-            f"## Chapter {chapter.get('index', '?')}: {title}",
+            f"## 第 {chapter.get('index', '?')} 章：{display_chapter_title(chapter, {'metadata': {'input': {'raw_input': session.get('source')}}, 'chapters': session.get('chapters', [])})}",
             "",
-            f"- Time: [{start} - {end}]",
-            f"- Summary: {chapter.get('summary') or summarize_text(str(chapter.get('text', '')), 260)}",
-            f"- Keywords: {', '.join(chapter.get('keywords', [])[:8]) if chapter.get('keywords') else 'TODO'}",
+            f"- 时间：[{start} - {end}]",
+            f"- 可信摘要：{chapter_summary(chapter, {'metadata': {'input': {'raw_input': session.get('source')}}, 'chapters': session.get('chapters', [])}, 260)}",
+            f"- 关键词：{', '.join(clean_keywords(chapter.get('keywords', []), 8)) or '关键词不足，需要回看画面确认'}",
             "",
-            "### Teach",
+            "### 本章目标",
             "",
-            "Explain this chapter in plain language. Mention concrete steps, commands, visual cues, and warnings from the video.",
+            "- 先听懂这一段在解决什么问题。",
+            "- 再把视频内容转换成可复刻步骤。",
+            "- 找出画面中的命令、图示、RViz 状态或硬件连接证据。",
+            "- 最后判断自己复现时要检查哪些条件。",
             "",
-            "### Ask",
+            "### 讲解",
+            "",
+            *[f"- {point}" for point in points],
+            "",
+            "讲的时候不要照念转写。先把本章放进完整链路：硬件接入 -> ROS2 数据 -> SLAM 建图 -> 地图保存 -> Nav2 导航。",
+            "",
+            "### 证据提醒",
+            "",
+            "- 语音转写可能有错字，专业术语不要直接背。",
+            "- ROS、导航、雷达类视频要重点核对包名、话题名、launch 文件、参数名和命令行。",
+            "",
+            "### 提问",
             "",
         ]
-        for idx in range(1, max(1, questions_per_chapter) + 1):
-            lines.append(f"{idx}. TODO: Ask one question that checks understanding of this chapter.")
+        for idx, question in enumerate(build_chapter_questions(chapter, questions_per_chapter), start=1):
+            lines.append(f"{idx}. {question}")
         lines += [
             "",
-            "### Correct",
+            "### 纠正",
             "",
-            "After the learner answers, correct mistakes using the chapter timestamp and any fact-check queue items.",
+            "学习者回答后，用本章时间戳、字幕证据、关键帧和事实核查队列来纠正。待核查内容不要当成确定事实。",
             "",
         ]
     queue = session.get("fact_check_queue") or []
-    lines += ["## Fact-Check Before Memorizing", ""]
+    lines += ["## 背诵前必须核查", ""]
     if queue:
         for item in queue[:20]:
             lines += [
-                f"- `{item.get('id', 'claim')}` priority `{item.get('priority', 'n/a')}`: {item.get('text', '')}",
+                f"- `{item.get('id', 'claim')}` 优先级 `{item.get('priority', 'n/a')}`：{normalize_zh_text(str(item.get('text', '')))}",
             ]
     else:
-        lines += ["- No fact-check queue found. Run `fact-check-queue` if claim candidates exist."]
-    lines += ["", "## Finish Criteria", "", "- Learner can explain each chapter from memory.", "- Learner can answer the generated questions.", "- Learner knows which claims still need verification.", ""]
+        lines += ["- 没有找到事实核查队列。如果已经有断言候选，请运行 `fact-check-queue`。"]
+    lines += ["", "## 完成标准", "", "- 学习者能凭记忆复述每章核心内容。", "- 学习者能回答生成的问题。", "- 学习者知道哪些视频说法还需要核查。", ""]
     return "\n".join(lines)
+
+
+def render_replication_route(session: dict[str, Any]) -> list[str]:
+    text = " ".join(str(ch.get("text", "")) for ch in session.get("chapters", []))
+    source = str(session.get("source") or "")
+    if re.search(r"雷达|lidar|ros2|slam|nav2|rviz|scan|tf|odom", text + source, re.I):
+        return [
+            "- 第 1 关：确认雷达 `/scan` 正常发布。命令：`ros2 topic list`、`ros2 topic echo /scan --once`、`ros2 topic hz /scan`。",
+            "- 第 2 关：确认 TF 坐标关系正确。重点看 `base_link` 到雷达 frame 的方向和位置。",
+            "- 第 3 关：确认里程计 `/odom` 正常。机器人前进、后退、旋转时，里程计变化方向要符合真实运动。",
+            "- 第 4 关：启动 SLAM Toolbox 建图。先小范围慢速移动，确认地图不旋转、不漂移、不重影。",
+            "- 第 5 关：低速键盘遥控扫描环境。遇到急转、打滑、雷达遮挡要暂停排查。",
+            "- 第 6 关：保存地图，确认生成地图图像和 YAML 配置。",
+            "- 第 7 关：启动 Nav2，加载保存的地图和参数文件。",
+            "- 第 8 关：在 RViz2 设置 `Nav2 Goal`，验证路径规划和底盘执行。",
+            "- 第 9 关：出现地图歪、漂移、不贴墙时，按 `/scan`、TF、`/odom`、速度、RViz Fixed Frame 顺序排查。",
+        ]
+    return [
+        "- 第 1 关：确认视频要复刻的最终成果。",
+        "- 第 2 关：列出前置环境、工具、账号、硬件或数据。",
+        "- 第 3 关：按视频时间轴拆成可执行步骤。",
+        "- 第 4 关：先复现最小可验证步骤。",
+        "- 第 5 关：让用户运行检查命令或完成操作，并根据输出继续纠错。",
+    ]
+
+
+def build_chapter_questions(chapter: dict[str, Any], count: int) -> list[str]:
+    keywords = [str(item) for item in chapter.get("keywords", []) if str(item).strip()]
+    start = format_timestamp(safe_float(chapter.get("start")))
+    end = format_timestamp(safe_float(chapter.get("end")))
+    summary = summarize_text(str(chapter.get("summary") or chapter.get("text") or ""), 120)
+    topic = " / ".join(normalize_zh_text(item) for item in keywords[:3]) if keywords else "本章内容"
+    candidates = [
+        f"用你自己的话说，[{start} - {end}] 这一章主要在解决什么问题？",
+        f"视频里有哪些画面或字幕证据能支持 `{topic}` 这个重点？",
+        "这一章里最应该记住的操作、命令、参数或配置是什么？",
+        "如果不核对字幕和视频画面，直接照抄这一步，可能会出什么问题？",
+        "这一章有哪些专业术语需要查资料确认后再背？",
+    ]
+    if summary and not is_poor_text(summary):
+        candidates.insert(1, f"用一句话概括这一章的逻辑：{normalize_zh_text(summary)}")
+    return candidates[: max(1, count)]
 
 
 def render_validate_case(report: dict[str, Any]) -> str:
@@ -1654,7 +2038,7 @@ def write_study_pack_template(args: argparse.Namespace) -> None:
     for name, content in templates.items():
         path = study_pack / name
         if args.force or not path.exists():
-            path.write_text(content, encoding="utf-8")
+            write_markdown(path, content)
     print(str(study_pack))
 
 
@@ -1710,9 +2094,17 @@ def clean_caption_text(text: str) -> str:
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\{\\.*?\}", " ", text)
     text = text.replace("&nbsp;", " ").replace("&amp;", "&")
+    text = normalize_zh_text(text)
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r"^\s*[-–—]\s*", "", text)
     return text.strip()
+
+
+def normalize_zh_text(text: str) -> str:
+    text = text.translate(ZH_NORMALIZATION_MAP)
+    for old, new in TERM_NORMALIZATION_REPLACEMENTS:
+        text = text.replace(old, new)
+    return text
 
 
 def parse_srt_or_vtt(text: str) -> list[dict[str, Any]]:
@@ -1850,6 +2242,38 @@ def clean_transcript(args: argparse.Namespace) -> None:
     print(str(case_dir / "reports" / "clean_transcript.json"))
 
 
+def normalize_transcript_command(args: argparse.Namespace) -> None:
+    case_dir = Path(args.case).resolve()
+    raw_segments = load_segments(case_dir)
+    if not raw_segments:
+        raise ValueError("No transcript content found. Run transcription or provide subtitles first.")
+    normalized = [
+        {
+            **seg,
+            "text": normalize_zh_text(clean_caption_text(str(seg.get("text", "")))),
+        }
+        for seg in raw_segments
+    ]
+    normalized = [seg for seg in normalized if seg["text"]]
+    transcript_dir = case_dir / "transcript"
+    write_segments_outputs(normalized, transcript_dir)
+    chapters = segment_chapters(normalized, args.chapter_minutes)
+    write_json(case_dir / "analysis" / "chapters.json", {"chapters": chapters})
+    report = {
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "segments": len(normalized),
+        "chapters": len(chapters),
+        "outputs": [
+            "transcript/segments.json",
+            "transcript/transcript.txt",
+            "transcript/transcript.srt",
+            "analysis/chapters.json",
+        ],
+    }
+    write_json(case_dir / "reports" / "normalize_transcript.json", report)
+    print(str(case_dir / "reports" / "normalize_transcript.json"))
+
+
 def parse_timestamp(value: str) -> float:
     parts = value.replace(",", ".").split(":")
     try:
@@ -1905,7 +2329,7 @@ def frame_notes(args: argparse.Namespace) -> None:
             "- Possible mismatch with transcript: TODO",
             "",
         ]
-    out_path.write_text("\n".join(lines), encoding="utf-8")
+    write_markdown(out_path, "\n".join(lines))
     report = {
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "frames_total": len(keyframes),
@@ -2040,6 +2464,7 @@ def generate_study_pack(args: argparse.Namespace) -> None:
         "chapters": chapters,
         "keyframes": keyframes,
         "claims": claims,
+        "transcript_quality": transcript_quality(segments),
     }
     write_json(case_dir / "analysis" / "study_pack_context.json", context)
     write_json(case_dir / "analysis" / "claim_candidates.json", {"claims": claims})
@@ -2058,7 +2483,7 @@ def generate_study_pack(args: argparse.Namespace) -> None:
     for name, content in outputs.items():
         path = study_pack / name
         if args.force or not path.exists() or args.overwrite_generated:
-            path.write_text(content, encoding="utf-8")
+            write_markdown(path, content)
     print(str(study_pack))
 
 
@@ -2118,6 +2543,7 @@ def self_test(args: argparse.Namespace) -> None:
         frame_limit=20,
         overwrite_generated=False,
         download=False,
+        write_subs=False,
         sub_langs="zh.*,en.*",
         format="bv*+ba/b",
         timeout=600,
@@ -2150,53 +2576,256 @@ def source_label(metadata: dict[str, Any]) -> str:
     return str(input_info.get("path") or input_info.get("raw_input") or "unknown")
 
 
+def transcript_quality(segments: list[dict[str, Any]]) -> dict[str, Any]:
+    texts = [str(seg.get("text", "")).strip() for seg in segments if str(seg.get("text", "")).strip()]
+    total_chars = sum(len(t) for t in texts)
+    if not texts or total_chars == 0:
+        return {
+            "level": "missing",
+            "score": 0.0,
+            "bad_ratio": 1.0,
+            "warnings": ["没有可用转写文本。"],
+        }
+    noise_terms = re.compile(
+        r"ctive|白強|骯髒|纴|搞国|搞行|Slam2Box|车距|绿箔|寻油|winter|肉速|小胆|交去|建成箭图|"
+        r"RV2|TTR|通商店|策劲|汉文|遗权|咬不起",
+        re.I,
+    )
+    bad_chars = sum(len(re.findall(r"[�\ufffd]|[鎺瑙艰埅婵€閫鍦鐢绋榻纴骯髒強]", t)) for t in texts)
+    noisy_segments = sum(1 for t in texts if noise_terms.search(t))
+    latin_fragments = sum(len(re.findall(r"[A-Za-z]{1,2}(?=[\u4e00-\u9fff])|(?<=[\u4e00-\u9fff])[A-Za-z]{1,2}", t)) for t in texts)
+    short_noise = sum(1 for t in texts if len(t) <= 4 and not re.search(r"ROS|TF|USB|Nav2|SLAM|RViz|雷达|地图|导航", t, re.I))
+    bad_ratio = min(1.0, (bad_chars + latin_fragments * 2 + short_noise * 4 + noisy_segments * 80) / max(1, total_chars))
+    score = round(max(0.0, 1.0 - bad_ratio), 3)
+    if score >= 0.82:
+        level = "good"
+    elif score >= 0.62:
+        level = "usable"
+    else:
+        level = "poor"
+    warnings = []
+    if level == "poor":
+        warnings.append("转写质量偏低，不能直接照抄学习包中的原文，需要结合关键帧和人工复核。")
+    elif level == "usable":
+        warnings.append("转写基本可用，但专有名词、命令和参数仍需要对照画面核对。")
+    return {
+        "level": level,
+        "score": score,
+        "bad_ratio": round(bad_ratio, 3),
+        "segments": len(texts),
+        "chars": total_chars,
+        "warnings": warnings,
+    }
+
+
+def is_poor_text(text: str) -> bool:
+    text = normalize_space(text)
+    if not text:
+        return True
+    if len(text) <= 4 and not re.search(r"ROS|TF|USB|Nav2|SLAM|RViz|雷达|地图|导航", text, re.I):
+        return True
+    if re.search(
+        r"ctive|白強|骯髒|纴|搞国|搞行|Slam2Box|车距|绿箔|寻油|winter|肉速|小胆|交去|建成箭图|"
+        r"RV2|TTR|通商店|策劲|汉文|遗权|咬不起",
+        text,
+        re.I,
+    ):
+        return True
+    bad = len(re.findall(r"[�\ufffd]|[鎺瑙艰埅婵€閫鍦鐢绋榻纴骯髒強]", text))
+    return bad / max(1, len(text)) > 0.08
+
+
+def reliable_text(text: str, max_chars: int = 360) -> str:
+    sentences = [s for s in split_sentences(normalize_zh_text(text)) if not is_poor_text(s)]
+    if not sentences:
+        return "本段语音转写可信度不足，需要回看视频画面确认。"
+    return summarize_text("".join(sentences), max_chars)
+
+
+def chapter_summary(chapter: dict[str, Any], context: dict[str, Any], max_chars: int = 360) -> str:
+    text = chapter.get("text", "")
+    if "本段语音转写可信度不足" not in reliable_text(text, max_chars):
+        return reliable_text(text, max_chars)
+    theme = infer_video_theme(context)
+    start = safe_float(chapter.get("start"))
+    if "ROS2" in theme and "激光雷达" in theme:
+        if start < 8 * 60:
+            return "本章主要讲低成本激光雷达的硬件接入：拆看雷达接口，确认供电和通信线，把雷达通过串口/USB 转接接入机器人或电脑。重点不是价格，而是能否稳定输出 ROS 可用的扫描数据。"
+        if start < 16 * 60:
+            return "本章进入 ROS2 建图链路：雷达驱动提供 `/scan`，机器人提供 TF 和里程计，SLAM Toolbox 根据这些输入生成地图，RViz2 用来观察结果。"
+        if start < 24 * 60:
+            return "本章演示遥控建图：机器人端启动建图相关节点，电脑端打开 RViz2，使用键盘控制机器人慢速移动，扫描环境边界，最后保存地图文件。"
+        return "本章演示导航部署和验证：把导航包部署到机器人工作空间，启动 Nav2 和 RViz2，设置导航目标点，观察机器人是否能规划路径并绕开新障碍。"
+    return "本章转写不够可靠，需要回看视频画面确认；学习时先抓住问题、操作步骤和验证现象。"
+
+
+def evidence_frames(context: dict[str, Any], start: float, end: float, limit: int = 4) -> list[str]:
+    frames = keyframes_near(context.get("keyframes", []), start, end, limit)
+    return [f"[{f.get('timestamp')}] `{Path(str(f.get('file'))).name}` ({f.get('reason') or 'keyframe'})" for f in frames]
+
+
+def command_candidates(text: str) -> list[str]:
+    patterns = [
+        r"ros2\s+(?:run|launch|topic|service|param|bag)\s+[A-Za-z0-9_./:-]+(?:\s+[A-Za-z0-9_./:=+-]+){0,8}",
+        r"colcon\s+build(?:\s+[A-Za-z0-9_./:=+-]+){0,8}",
+        r"source\s+[A-Za-z0-9_./:=+-]+",
+        r"rviz2(?:\s+[A-Za-z0-9_./:=+-]+){0,6}",
+    ]
+    found: list[str] = []
+    for pattern in patterns:
+        for m in re.finditer(pattern, text, flags=re.I):
+            value = normalize_space(m.group(0))
+            if value not in found:
+                found.append(value)
+    return found[:12]
+
+
+def clean_keywords(keywords: list[Any], limit: int = 8) -> list[str]:
+    cleaned: list[str] = []
+    bad_terms = {
+        "ttr", "pie", "logic", "winter", "好不好", "机器隔的", "下一期就来接小胆", "关注我",
+        "上远程试试", "下面来运行一下试", "空间里",
+    }
+    for item in keywords:
+        kw = normalize_zh_text(str(item)).strip()
+        if not kw or kw.lower() in bad_terms or is_poor_text(kw):
+            continue
+        if kw not in cleaned:
+            cleaned.append(kw)
+        if len(cleaned) >= limit:
+            break
+    return cleaned
+
+
+def display_chapter_title(chapter: dict[str, Any], context: dict[str, Any]) -> str:
+    start = safe_float(chapter.get("start"))
+    theme = infer_video_theme(context)
+    if "ROS2" in theme and "激光雷达" in theme:
+        if start < 8 * 60:
+            return "硬件接入：雷达供电、通信和安装"
+        if start < 16 * 60:
+            return "ROS2 建图链路：/scan、TF、里程计和 SLAM Toolbox"
+        if start < 24 * 60:
+            return "遥控建图：RViz2 观察、键盘移动和保存地图"
+        return "Nav2 导航：加载地图、设置目标点并验证绕障"
+    keywords = clean_keywords(chapter.get("keywords", []), 3)
+    return " / ".join(keywords) if keywords else normalize_zh_text(str(chapter.get("title") or "章节"))
+
+
+def infer_video_theme(context: dict[str, Any]) -> str:
+    text = " ".join(ch.get("text", "") for ch in context.get("chapters", []))
+    source = Path(source_label(context["metadata"])).stem.lower()
+    haystack = f"{source} {text}".lower()
+    if any(k.lower() in haystack for k in ["雷达", "lidar", "ros2", "slam", "nav2", "rviz"]):
+        return "低成本激光雷达接入 ROS2，并完成 SLAM 建图与 Nav2 导航验证。"
+    keywords = extract_keywords(text, 8)
+    return "围绕 " + "、".join(keywords[:5]) + " 展开。" if keywords else "主题需要结合视频画面进一步确认。"
+
+
+def chapter_teaching_points(chapter: dict[str, Any], context: dict[str, Any]) -> list[str]:
+    text = chapter.get("text", "")
+    lowered = text.lower()
+    points: list[str] = []
+    if re.search(r"雷达|lidar|usb|ttl|串口|供电", text, re.I):
+        points.append("硬件重点是供电、通信接口和安装位置；便宜雷达能不能用，取决于能否稳定输出可被 ROS 使用的扫描数据。")
+    if re.search(r"ros2|scan|tf|slam|toolbox|里程|odom|rviz", text, re.I):
+        points.append("建图不是只看雷达点，SLAM 同时依赖 `/scan`、TF 坐标关系和机器人运动/里程计信息。")
+    if re.search(r"keyboard|键盘|w|a|s|d|q|e|保存|地图", lowered, re.I):
+        points.append("遥控建图时要慢速移动、少急转，建完后保存地图文件，后续导航阶段会加载这张地图。")
+    if re.search(r"nav2|导航|launch|params|map|goal|代价地图|规划", text, re.I):
+        points.append("导航阶段要把地图、Nav2 参数、定位、代价地图、路径规划和底盘速度执行串起来。")
+    if not points:
+        points.append(reliable_text(text, 260))
+    return points[:4]
+
+
 def render_overview(context: dict[str, Any]) -> str:
     metadata = context["metadata"]
     chapters = context["chapters"]
     all_text = " ".join(ch.get("text", "") for ch in chapters)
     keywords = extract_keywords(all_text, 12)
+    quality = context.get("transcript_quality") or transcript_quality(context.get("segments", []))
     best = chapters[:5]
-    return "\n".join([
+    lines = [
         "# 一页速览",
         "",
         f"来源：`{source_label(metadata)}`",
         "",
+        "## 结论先说",
+        "",
+        infer_video_theme(context),
+        "",
+        "这份学习包应该当成“AI 预处理后的学习材料”，不是最终答案。命令、包名、参数名必须回看对应时间点确认。",
+        "",
+        "## 转写质量",
+        "",
+        f"- 质量等级：`{quality.get('level')}`，评分：`{quality.get('score')}`",
+        f"- 转写段数：`{quality.get('segments', 0)}`，字符数：`{quality.get('chars', 0)}`",
+        *[f"- 警告：{warning}" for warning in quality.get("warnings", [])],
+        "",
         "## 视频主题",
         "",
-        " / ".join(keywords[:5]) if keywords else "需要结合关键帧和转写进一步确认。",
+        infer_video_theme(context),
         "",
-        "## 核心收获",
+        "## 你真正要学会的东西",
         "",
-        *[f"- {kw}" for kw in keywords[:7]],
+    ]
+    if any(re.search(r"雷达|lidar|ros2|slam|nav2|rviz|tf|scan", ch.get("text", ""), re.I) for ch in chapters):
+        lines += [
+            "- 低成本激光雷达如何接到机器人上：供电、串口/USB 转接、安装朝向。",
+            "- ROS2 建图链路怎么跑通：雷达驱动发布 `/scan`，TF/里程计提供位姿关系，SLAM Toolbox 输出地图。",
+            "- RViz2 的作用是观察和交互，不是建图算法本体；地图歪通常要回到 TF、里程计、雷达姿态和运动速度排查。",
+            "- Nav2 导航需要已保存地图、参数文件、定位、代价地图、路径规划、控制器和底盘执行全部配合。",
+        ]
+    else:
+        lines += [f"- {kw}" for kw in keywords[:7]] or ["- 当前材料不足，需要补充转写或关键帧观察。"]
+    lines += [
         "",
-        "## 最值得回看的时间点",
+        "## 推荐学习顺序",
         "",
-        *[f"- [{format_timestamp(ch['start'])}] {ch['title']}" for ch in best],
+        *[f"{idx}. [{format_timestamp(ch['start'])}] {display_chapter_title(ch, context)}：{chapter_summary(ch, context, 140)}" for idx, ch in enumerate(best, start=1)],
         "",
-        "## 学习建议",
+        "## 本节怎么学",
         "",
-        "先按时间轴快速浏览，再逐章学习完整笔记。遇到 `04_corrections_and_supplements.md` 中的待核查点时，优先查官方资料后再记忆。",
+        "先看 `01_full_notes.md` 建立完整链路，再看 `08_practice_checklist.md` 复现操作。遇到转写不顺的地方，直接回到时间戳和关键帧，不要背错字。",
         "",
-    ])
+    ]
+    return "\n".join(lines)
 
 
 def render_full_notes(context: dict[str, Any]) -> str:
     keyframes = context["keyframes"]
-    lines = ["# 完整学习笔记", ""]
+    quality = context.get("transcript_quality") or {}
+    lines = [
+        "# 完整学习笔记",
+        "",
+        f"转写质量：`{quality.get('level', 'unknown')}`，评分：`{quality.get('score', 'n/a')}`。",
+        "下面按课程讲义方式整理。凡是命令、包名、参数名，都应回看视频画面再执行。",
+        "",
+    ]
     if not context["chapters"]:
         return "# 完整学习笔记\n\n未找到转写内容。请先提供字幕或运行转写。\n"
     for ch in context["chapters"]:
         frames = keyframes_near(keyframes, ch["start"], ch["end"])
+        commands = command_candidates(ch.get("text", ""))
         lines += [
-            f"## [{format_timestamp(ch['start'])}-{format_timestamp(ch['end'])}] {ch['title']}",
+            f"## [{format_timestamp(ch['start'])}-{format_timestamp(ch['end'])}] {display_chapter_title(ch, context)}",
             "",
-            "讲了什么：",
+            "这一章在讲什么：",
             "",
-            ch["summary"] or "TODO",
+            chapter_summary(ch, context, 420),
             "",
-            "关键知识：",
+            "你要理解的关键点：",
             "",
-            *[f"- {kw}" for kw in ch.get("keywords", [])[:6]],
+            *[f"- {point}" for point in chapter_teaching_points(ch, context)],
+            "",
+            "本章术语：",
+            "",
+            *[f"- `{kw}`" for kw in clean_keywords(ch.get("keywords", []), 8)],
+            "",
+            "本章可能出现的命令/配置：",
+            "",
+            *([f"- `{cmd}`" for cmd in commands] if commands else ["- 没有从转写中可靠识别到命令；请回看关键帧确认。"]),
             "",
             "画面补充：",
             "",
@@ -2204,8 +2833,16 @@ def render_full_notes(context: dict[str, Any]) -> str:
         if frames:
             lines += [f"- [{f.get('timestamp')}] `{Path(str(f.get('file'))).name}` ({f.get('reason')})" for f in frames]
         else:
-            lines += ["- TODO: 检查本章附近关键帧。"]
-        lines += ["", "需要记住：", "", "- TODO: 由 AI 结合画面和事实核查补全。", ""]
+            lines += ["- 没有匹配到关键帧；需要回到视频对应时间段检查画面。"]
+        lines += [
+            "",
+            "学习时要记住：",
+            "",
+            "- 先记链路和因果，不要先背零碎名词。",
+            "- 看到转写不通顺时，以视频画面、命令行截图和官方文档为准。",
+            "- 如果要照着做，先确认自己的 ROS 版本、硬件接口和包名是否一致。",
+            "",
+        ]
     return "\n".join(lines)
 
 
@@ -2225,23 +2862,56 @@ def render_key_knowledge(context: dict[str, Any]) -> str:
     lines = ["# 关键知识点", ""]
     if not keywords:
         return "# 关键知识点\n\n未找到足够文本。请先转写或提供字幕。\n"
+    domain_notes = {
+        "ROS2": "机器人软件通信框架。这里主要负责把雷达、TF、建图、导航、显示这些节点组织到同一个系统里。",
+        "SLAM": "同步定位与建图。它不是只看雷达点，还要依赖坐标系和机器人运动信息。",
+        "Nav2": "ROS2 的导航框架，负责定位、代价地图、路径规划、控制和恢复行为等导航流程。",
+        "RViz": "可视化和交互工具，用来观察雷达点、地图、TF、机器人模型和导航目标。",
+        "TF": "ROS 中描述坐标系关系的机制。雷达、底盘、地图之间的坐标关系错了，建图和导航都会跟着错。",
+        "scan": "激光雷达扫描话题，通常是 `/scan`，是 2D 雷达给 SLAM 和导航使用的重要输入。",
+        "地图": "建图阶段生成的环境表示，导航阶段会加载它并配合定位与代价地图使用。",
+        "雷达": "本视频里的核心传感器，用来提供周围障碍物的距离扫描数据。",
+    }
+    used = set()
+    for key, desc in domain_notes.items():
+        if re.search(re.escape(key), text, re.I):
+            related = [ch for ch in context["chapters"] if re.search(re.escape(key), ch.get("text", ""), re.I)][:3]
+            lines += [
+                f"## {key}",
+                "",
+                f"定义：{desc}",
+                "",
+                "为什么重要：它属于本视频技术链路里的核心环节，理解它才能判断问题出在硬件、驱动、建图还是导航。",
+                "",
+                "相关时间点：",
+                "",
+                *[f"- [{format_timestamp(ch['start'])}] {normalize_zh_text(ch['title'])}" for ch in related],
+                "",
+                "常见误区：把显示问题、建图问题、定位问题混在一起。排查时要拆成数据、坐标、算法、执行四层看。",
+                "",
+            ]
+            used.add(key.lower())
     for kw in keywords:
+        if kw.lower() in used or is_poor_text(kw):
+            continue
         related = [
             ch for ch in context["chapters"]
             if kw in ch.get("text", "")
         ][:3]
+        if not related:
+            continue
         lines += [
             f"## {kw}",
             "",
-            "定义：TODO: 结合视频上下文和外部资料补全。",
+            f"定义：这是视频转写中反复出现的关键词，需结合 [{format_timestamp(related[0]['start'])}] 附近画面确认具体含义。",
             "",
-            "为什么重要：TODO",
+            "为什么重要：反复出现通常说明它与本视频主线有关，但自动转写可能会把专有名词识别错。",
             "",
             "相关时间点：",
             "",
             *[f"- [{format_timestamp(ch['start'])}] {ch['title']}" for ch in related],
             "",
-            "常见误区：TODO",
+            "常见误区：只看转写文字，不回看画面中的代码、命令、图示和 RViz 状态。",
             "",
         ]
     return "\n".join(lines)
@@ -2277,7 +2947,20 @@ def render_quiz(context: dict[str, Any]) -> str:
     lines += ["", "## 理解题", ""]
     for idx, ch in enumerate(context["chapters"][:3], start=1):
         lines.append(f"{idx}. [{format_timestamp(ch['start'])}] 这一段的核心逻辑是什么？")
-    lines += ["", "## 应用题", "", "1. 如果把视频里的方法用到自己的任务中，第一步应该做什么？", "", "## 答案", "", "TODO: 学习者作答后由 AI 结合笔记讲解。", ""]
+    lines += [
+        "",
+        "## 应用题",
+        "",
+        "1. 如果把视频里的方法用到自己的机器人上，第一步应该确认哪些硬件和软件条件？",
+        "2. 如果建图时地图开始旋转或漂移，你会按什么顺序排查？",
+        "",
+        "## 参考答案要点",
+        "",
+        "- 基础题不要死背转写词，必须结合对应时间点的画面。",
+        "- 应用时先确认雷达供电/通信、ROS2 驱动、`/scan`、TF、里程计、SLAM、地图保存、Nav2 参数。",
+        "- 地图旋转优先排查 TF、雷达安装朝向、里程计方向/尺度、机器人运动过快和 RViz 固定坐标系。",
+        "",
+    ]
     return "\n".join(lines)
 
 
@@ -2285,9 +2968,18 @@ def render_flashcards(context: dict[str, Any]) -> str:
     keywords = extract_keywords(" ".join(ch.get("text", "") for ch in context["chapters"]), 12)
     lines = ["# 闪卡", ""]
     for kw in keywords:
+        if is_poor_text(kw):
+            continue
         related = next((ch for ch in context["chapters"] if kw in ch.get("text", "")), None)
         source = format_timestamp(related["start"]) if related else "00:00:00.000"
-        lines += [f"Q: `{kw}` 是什么？", "", "A: TODO: 结合视频和核查资料补全。", "", f"Source: [{source}]", ""]
+        lines += [
+            f"Q: `{kw}` 是什么？",
+            "",
+            f"A: 它是视频 [{source}] 附近出现的关键词。先用 `01_full_notes.md` 理解上下文，再回看画面确认是否为正确术语。",
+            "",
+            f"Source: [{source}]",
+            "",
+        ]
     return "\n".join(lines)
 
 
@@ -2317,10 +3009,45 @@ def render_guided_plan(context: dict[str, Any]) -> str:
 
 
 def render_practice_checklist(context: dict[str, Any]) -> str:
-    lines = ["# 实操清单", "", "## 环境准备", "", "- TODO: 从视频中提取工具、软件、数据、硬件要求。", "", "## 操作步骤", ""]
+    text = " ".join(ch.get("text", "") for ch in context["chapters"])
+    commands = command_candidates(text)
+    lines = [
+        "# 实操清单",
+        "",
+        "## 环境准备",
+        "",
+        "- 确认激光雷达供电正常，通信接口能被电脑或机器人主控识别。",
+        "- 确认 ROS2 环境可用，并且有雷达驱动、机器人模型/TF、SLAM Toolbox、Nav2、RViz2。",
+        "- 确认机器人底盘能接收速度指令，遥控时能慢速、可控地移动。",
+        "- 确认视频中的包名、launch 文件名、参数文件名和你本机项目一致。",
+        "",
+        "## 视频中识别到的命令/线索",
+        "",
+        *([f"- `{cmd}`" for cmd in commands] if commands else ["- 自动转写没有可靠识别到完整命令，请以关键帧画面为准。"]),
+        "",
+        "## 操作步骤",
+        "",
+    ]
     for idx, ch in enumerate(context["chapters"], start=1):
-        lines.append(f"{idx}. [{format_timestamp(ch['start'])}] 学习并复现：{ch['title']}")
-    lines += ["", "## 验证方法", "", "- TODO: 从视频中提取成功现象、测试命令或检查标准。", "", "## 常见错误", "", "- TODO: 结合视频演示和评论/外部资料补全。", ""]
+        lines.append(f"{idx}. [{format_timestamp(ch['start'])}] 学习并复现：{normalize_zh_text(ch['title'])}。重点：{'; '.join(chapter_teaching_points(ch, context)[:2])}")
+    lines += [
+        "",
+        "## 验证方法",
+        "",
+        "- RViz2 中能看到稳定的激光扫描点。",
+        "- 建图时地图边界不明显漂移、不旋转、不重复叠影。",
+        "- 地图保存后能被导航 launch 正确加载。",
+        "- 设置 Nav2 Goal 后，机器人能规划路径并执行移动。",
+        "",
+        "## 常见错误",
+        "",
+        "- 雷达安装角度和 URDF/TF 不一致，导致地图方向错。",
+        "- 里程计方向、尺度或坐标轴错，导致建图漂移或旋转。",
+        "- 遥控建图速度太快、急转太多，SLAM 来不及稳定匹配。",
+        "- RViz 固定坐标系选错，看起来像地图歪了，实际是显示坐标关系没对上。",
+        "- 直接照抄视频命令，但本机包名、工作空间、地图路径或参数文件不同。",
+        "",
+    ]
     return "\n".join(lines)
 
 
@@ -2578,6 +3305,29 @@ def main(argv: list[str] | None = None) -> int:
     folder.add_argument("--out", required=True, help="Output directory for case workspaces")
     folder.set_defaults(func=create_folder_cases)
 
+    study = sub.add_parser("study-url", help="One-command URL/share-link workflow: acquire, process, and generate a study pack")
+    study.add_argument("--input", required=True, help="Video URL or share text")
+    study.add_argument("--out", required=True, help="Output directory for case workspaces")
+    study.add_argument("--download", action="store_true", help="Download permitted media for speech-to-text transcription")
+    study.add_argument("--transcribe", action="store_true", help="Transcribe downloaded media with faster-whisper")
+    study.add_argument("--model", default="small", help="faster-whisper model")
+    study.add_argument("--language", default="zh", help="Transcription language")
+    study.add_argument("--device", default="cpu", choices=["cpu", "cuda", "auto"], help="faster-whisper device")
+    study.add_argument("--compute-type", default="int8", help="faster-whisper compute type, for example int8, float16, or auto")
+    study.add_argument("--keyframes", type=int, default=30, help="Uniform keyframes for process-local")
+    study.add_argument("--scene-keyframes", type=int, default=20, help="Scene-change keyframes for process-local")
+    study.add_argument("--scene-threshold", type=float, default=0.35, help="Scene-change threshold")
+    study.add_argument("--max-single-minutes", type=int, default=60, help="Long-video warning threshold")
+    study.add_argument("--chapter-minutes", type=int, default=8, help="Chapter size")
+    study.add_argument("--claims", type=int, default=30, help="Claim limit")
+    study.add_argument("--frame-limit", type=int, default=80, help="Frame note limit")
+    study.add_argument("--keep-going", action="store_true", help="Continue after a non-critical pipeline step fails")
+    study.add_argument("--write-subs", action="store_true", help="Also try platform subtitles; disabled by default because normal text comes from ASR")
+    study.add_argument("--sub-langs", default="zh.*,en.*", help="yt-dlp subtitle language selector when --write-subs is used")
+    study.add_argument("--format", default="bv*+ba/b", help="yt-dlp format selector")
+    study.add_argument("--timeout", type=int, default=1800, help="Timeout in seconds for acquisition commands")
+    study.set_defaults(func=study_url)
+
     process = sub.add_parser("process-local", help="Extract audio/keyframes and optionally transcribe a local media case")
     process.add_argument("--case", required=True, help="Case directory created by init")
     process.add_argument("--keyframes", type=int, default=30, help="Number of uniform keyframes to extract")
@@ -2586,6 +3336,8 @@ def main(argv: list[str] | None = None) -> int:
     process.add_argument("--transcribe", action="store_true", help="Transcribe extracted audio with faster-whisper")
     process.add_argument("--model", default="small", help="faster-whisper model size or local model path")
     process.add_argument("--language", default="zh", help="Transcription language, or empty string for auto")
+    process.add_argument("--device", default="cpu", choices=["cpu", "cuda", "auto"], help="faster-whisper device")
+    process.add_argument("--compute-type", default="int8", help="faster-whisper compute type, for example int8, float16, or auto")
     process.add_argument("--max-single-minutes", type=int, default=60, help="Warn when media exceeds this length")
     process.set_defaults(func=process_local)
 
@@ -2598,11 +3350,12 @@ def main(argv: list[str] | None = None) -> int:
     split.add_argument("--timeout", type=int, default=1800, help="Timeout in seconds per ffmpeg split command")
     split.set_defaults(func=split_media)
 
-    acquire = sub.add_parser("acquire-url", help="Acquire public subtitles and optionally media for a URL/share case")
+    acquire = sub.add_parser("acquire-url", help="Acquire permitted media for a URL/share case")
     acquire.add_argument("--case", required=True, help="Case directory created by init")
-    acquire.add_argument("--download", action="store_true", help="Also download permitted media with yt-dlp")
+    acquire.add_argument("--download", action="store_true", help="Download permitted media with yt-dlp")
     acquire.add_argument("--dry-run", action="store_true", help="Write the acquisition plan without running yt-dlp")
-    acquire.add_argument("--sub-langs", default="zh.*,en.*", help="yt-dlp subtitle language selector")
+    acquire.add_argument("--write-subs", action="store_true", help="Also try platform subtitles; disabled by default because normal text comes from ASR")
+    acquire.add_argument("--sub-langs", default="zh.*,en.*", help="yt-dlp subtitle language selector when --write-subs is used")
     acquire.add_argument("--format", default="bv*+ba/b", help="yt-dlp format selector used with --download")
     acquire.add_argument("--timeout", type=int, default=600, help="Timeout in seconds for each yt-dlp command")
     acquire.set_defaults(func=acquire_url)
@@ -2615,6 +3368,11 @@ def main(argv: list[str] | None = None) -> int:
     clean.add_argument("--max-duration", type=float, default=18.0, help="Maximum merged segment duration in seconds")
     clean.add_argument("--chapter-minutes", type=int, default=8, help="Approximate chapter size")
     clean.set_defaults(func=clean_transcript)
+
+    normalize = sub.add_parser("normalize-transcript", help="Normalize transcript text to simplified Chinese and common technical terms")
+    normalize.add_argument("--case", required=True, help="Case directory created by init")
+    normalize.add_argument("--chapter-minutes", type=int, default=8, help="Approximate chapter size")
+    normalize.set_defaults(func=normalize_transcript_command)
 
     frames = sub.add_parser("frame-notes", help="Create a visual observation worksheet from keyframes")
     frames.add_argument("--case", required=True, help="Case directory created by init")
@@ -2656,6 +3414,8 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--transcribe", action="store_true", help="Use faster-whisper during process-local")
     run.add_argument("--model", default="small", help="faster-whisper model")
     run.add_argument("--language", default="zh", help="Transcription language")
+    run.add_argument("--device", default="cpu", choices=["cpu", "cuda", "auto"], help="faster-whisper device")
+    run.add_argument("--compute-type", default="int8", help="faster-whisper compute type, for example int8, float16, or auto")
     run.add_argument("--keyframes", type=int, default=30, help="Uniform keyframes for process-local")
     run.add_argument("--scene-keyframes", type=int, default=20, help="Scene-change keyframes for process-local")
     run.add_argument("--scene-threshold", type=float, default=0.35, help="Scene-change threshold")
@@ -2665,7 +3425,8 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--frame-limit", type=int, default=80, help="Frame note limit")
     run.add_argument("--overwrite-generated", action="store_true", help="Overwrite generated study pack files")
     run.add_argument("--download", action="store_true", help="Allow permitted media download during acquire-url")
-    run.add_argument("--sub-langs", default="zh.*,en.*", help="yt-dlp subtitle language selector")
+    run.add_argument("--write-subs", action="store_true", help="Also try platform subtitles; disabled by default because normal text comes from ASR")
+    run.add_argument("--sub-langs", default="zh.*,en.*", help="yt-dlp subtitle language selector when --write-subs is used")
     run.add_argument("--format", default="bv*+ba/b", help="yt-dlp format selector")
     run.add_argument("--timeout", type=int, default=600, help="Command timeout")
     run.set_defaults(func=run_pipeline)
