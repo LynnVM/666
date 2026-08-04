@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 venv/
 video-study-cases/
+work/
 *.mp4
 *.mov
 *.mkv

@@ -26,6 +26,11 @@ VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".flv", ".m4v"}
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".flac", ".aac", ".ogg"}
 SUBTITLE_EXTS = {".srt", ".vtt", ".ass", ".txt"}
 URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+SENTENCE_RE = re.compile(r"[^。！？!?；;\n]+[。！？!?；;]?", re.UNICODE)
+CLAIM_HINT_RE = re.compile(
+    r"(必须|一定|不会|不能|可以|应该|需要|导致|因为|所以|原理|定义|区别|优点|缺点|最好|唯一|always|never|must|should|because|therefore)",
+    re.IGNORECASE,
+)
 STUDY_PACK_FILES = [
     "00_overview.md",
     "01_full_notes.md",
@@ -123,6 +128,16 @@ def classify_input(raw_input: str) -> dict:
 
 def which(name: str) -> str | None:
     return shutil.which(name)
+
+
+def find_yt_dlp_cmd() -> list[str] | None:
+    exe = which("yt-dlp") or which("yt_dlp")
+    if exe:
+        return [exe]
+    code, _ = run_capture([sys.executable, "-m", "yt_dlp", "--version"], timeout=10)
+    if code == 0:
+        return [sys.executable, "-m", "yt_dlp"]
+    return None
 
 
 def find_python_module_binary(module: str, attr: str) -> str | None:
@@ -240,7 +255,11 @@ def write_json(path: Path, data: dict) -> None:
 
 
 def read_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def read_text_if_exists(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
 
 
 def build_case(args_input: str, out_dir: Path) -> Path:
@@ -316,6 +335,112 @@ def create_folder_cases(args: argparse.Namespace) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     write_json(out_dir.resolve() / "folder_cases.json", index)
     print(str(out_dir.resolve() / "folder_cases.json"))
+
+
+def acquire_url(args: argparse.Namespace) -> None:
+    case_dir = Path(args.case).resolve()
+    metadata_path = case_dir / "metadata.json"
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"metadata.json not found: {metadata_path}")
+    metadata = read_json(metadata_path)
+    input_info = metadata.get("input", {})
+    if input_info.get("kind") not in {"url", "share_text"}:
+        raise ValueError("acquire-url requires a url or share_text case")
+    urls = input_info.get("urls") or []
+    if not urls:
+        raise ValueError("No URL found in case metadata")
+    url = urls[0]
+    ytdlp = find_yt_dlp_cmd()
+    report: dict[str, Any] = {
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "url": url,
+        "platform": input_info.get("platform"),
+        "yt_dlp": ytdlp,
+        "dry_run": args.dry_run,
+        "mode": "subtitles_only" if not args.download else "subtitles_and_media",
+        "sub_langs": args.sub_langs,
+        "subtitles": None,
+        "media": None,
+        "warnings": [],
+    }
+    if not ytdlp:
+        report["warnings"].append("yt-dlp is not installed. Install yt-dlp or provide a local video/subtitle file.")
+        report["finished_at"] = datetime.now(timezone.utc).isoformat()
+        write_json(case_dir / "reports" / "acquire_url.json", report)
+        metadata["acquire_url"] = report
+        write_json(metadata_path, metadata)
+        print(str(case_dir / "reports" / "acquire_url.json"))
+        return
+
+    subtitle_dir = case_dir / "transcript" / "subtitles"
+    subtitle_dir.mkdir(parents=True, exist_ok=True)
+    subtitle_cmd = ytdlp + [
+        "--skip-download",
+        "--write-subs",
+        "--write-auto-subs",
+        "--sub-langs",
+        args.sub_langs,
+        "--convert-subs",
+        "srt",
+        "--no-playlist",
+        "--ignore-errors",
+        "-o",
+        str(subtitle_dir / "%(title).100s.%(ext)s"),
+        url,
+    ]
+    report["subtitles"] = {"command": subtitle_cmd}
+    if not args.dry_run:
+        code, out = run_capture(subtitle_cmd, timeout=args.timeout)
+        report["subtitles"].update({"returncode": code, "output_tail": out[-4000:]})
+        report["subtitles"]["files"] = [str(p) for p in subtitle_dir.glob("*")]
+
+    if args.download:
+        media_dir = case_dir / "media"
+        media_dir.mkdir(parents=True, exist_ok=True)
+        media_cmd = ytdlp + [
+            "-f",
+            args.format,
+            "--merge-output-format",
+            "mp4",
+            "--no-playlist",
+            "--ignore-errors",
+            "-o",
+            str(media_dir / "source.%(ext)s"),
+            url,
+        ]
+        report["media"] = {"command": media_cmd}
+        if not args.dry_run:
+            code, out = run_capture(media_cmd, timeout=args.timeout)
+            files = [
+                str(p) for p in media_dir.glob("source.*")
+                if p.suffix.lower() in VIDEO_EXTS | AUDIO_EXTS
+            ]
+            report["media"].update({"returncode": code, "output_tail": out[-4000:], "files": files})
+            if files:
+                report["media_file"] = files[0]
+                report["media_probe"] = probe_media(Path(files[0]))
+                metadata["input"] = {
+                    **input_info,
+                    "acquired_media_path": files[0],
+                    "acquired_media_kind": "local_video",
+                }
+            else:
+                report["warnings"].append(
+                    "No media file was acquired. Provide a local video/audio/subtitle file if the platform blocks access."
+                )
+
+    if not args.dry_run:
+        subtitle_files = report.get("subtitles", {}).get("files") or []
+        if not subtitle_files:
+            report["warnings"].append(
+                "No subtitle file was acquired. Try --download for permitted media, or provide a local subtitle/video file."
+            )
+
+    report["finished_at"] = datetime.now(timezone.utc).isoformat()
+    metadata["acquire_url"] = report
+    write_json(metadata_path, metadata)
+    write_json(case_dir / "reports" / "acquire_url.json", report)
+    print(str(case_dir / "reports" / "acquire_url.json"))
 
 
 def extract_audio(ffmpeg: str, source: Path, out_wav: Path) -> None:
@@ -616,6 +741,366 @@ def write_study_pack_template(args: argparse.Namespace) -> None:
     print(str(study_pack))
 
 
+def load_segments(case_dir: Path) -> list[dict[str, Any]]:
+    segments_path = case_dir / "transcript" / "segments.json"
+    transcript_path = case_dir / "transcript" / "transcript.txt"
+    if segments_path.exists():
+        data = read_json(segments_path)
+        return [
+            {"start": float(s.get("start", 0.0)), "end": float(s.get("end", 0.0)), "text": str(s.get("text", "")).strip()}
+            for s in data.get("segments", [])
+            if str(s.get("text", "")).strip()
+        ]
+    text = read_text_if_exists(transcript_path).strip()
+    if not text:
+        return []
+    segments = []
+    for idx, line in enumerate(text.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r"\[([0-9:.]+)\s+-\s+([0-9:.]+)\]\s*(.*)", line)
+        if m:
+            segments.append({"start": parse_timestamp(m.group(1)), "end": parse_timestamp(m.group(2)), "text": m.group(3).strip()})
+        else:
+            segments.append({"start": float(idx * 30), "end": float((idx + 1) * 30), "text": line})
+    return segments
+
+
+def parse_timestamp(value: str) -> float:
+    parts = value.replace(",", ".").split(":")
+    try:
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + float(parts[1])
+        return float(parts[0])
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def load_keyframes(case_dir: Path) -> list[dict[str, Any]]:
+    path = case_dir / "keyframes" / "keyframes.json"
+    if not path.exists():
+        return []
+    return read_json(path).get("frames", [])
+
+
+def segment_chapters(segments: list[dict[str, Any]], chapter_minutes: int) -> list[dict[str, Any]]:
+    if not segments:
+        return []
+    window = max(5, chapter_minutes) * 60
+    chapters: list[dict[str, Any]] = []
+    current: list[dict[str, Any]] = []
+    start = float(segments[0]["start"])
+    for seg in segments:
+        if current and float(seg["start"]) - start >= window:
+            chapters.append(make_chapter(current, len(chapters) + 1))
+            current = []
+            start = float(seg["start"])
+        current.append(seg)
+    if current:
+        chapters.append(make_chapter(current, len(chapters) + 1))
+    return chapters
+
+
+def make_chapter(segments: list[dict[str, Any]], index: int) -> dict[str, Any]:
+    text = normalize_space(" ".join(str(s["text"]) for s in segments))
+    keywords = extract_keywords(text, 8)
+    title = " / ".join(keywords[:3]) if keywords else f"Part {index}"
+    return {
+        "index": index,
+        "start": float(segments[0]["start"]),
+        "end": float(segments[-1]["end"]),
+        "title": title,
+        "segments": segments,
+        "text": text,
+        "keywords": keywords,
+        "summary": summarize_text(text, 220),
+    }
+
+
+def normalize_space(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def split_sentences(text: str) -> list[str]:
+    return [normalize_space(m.group(0)) for m in SENTENCE_RE.finditer(text) if normalize_space(m.group(0))]
+
+
+def summarize_text(text: str, max_chars: int) -> str:
+    sentences = split_sentences(text)
+    if not sentences:
+        return text[:max_chars]
+    out = ""
+    for sentence in sentences:
+        if len(out) + len(sentence) > max_chars and out:
+            break
+        out += sentence
+    return out[:max_chars].strip()
+
+
+def extract_keywords(text: str, limit: int) -> list[str]:
+    stop = {
+        "然后", "这个", "就是", "我们", "你们", "他们", "如果", "因为", "所以", "但是", "一个", "这里",
+        "可以", "没有", "进行", "时候", "需要", "the", "and", "that", "this", "with", "for", "you", "are",
+    }
+    words = re.findall(r"[A-Za-z][A-Za-z0-9_+-]{2,}|[\u4e00-\u9fff]{2,8}", text)
+    counts: dict[str, int] = {}
+    for word in words:
+        if word.lower() in stop or word in stop:
+            continue
+        counts[word] = counts.get(word, 0) + 1
+    return [w for w, _ in sorted(counts.items(), key=lambda item: (-item[1], item[0]))[:limit]]
+
+
+def keyframes_near(keyframes: list[dict[str, Any]], start: float, end: float, limit: int = 5) -> list[dict[str, Any]]:
+    frames = [
+        f for f in keyframes
+        if f.get("timestamp_seconds") is not None and start <= float(f["timestamp_seconds"]) <= end
+    ]
+    return frames[:limit]
+
+
+def extract_claim_candidates(segments: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    claims = []
+    for seg in segments:
+        for sentence in split_sentences(str(seg["text"])):
+            if len(sentence) < 10:
+                continue
+            if CLAIM_HINT_RE.search(sentence):
+                claims.append({
+                    "timestamp": format_timestamp(float(seg["start"])),
+                    "start": float(seg["start"]),
+                    "text": sentence,
+                    "reason": "contains claim-like wording",
+                    "status": "needs_fact_check",
+                })
+            if len(claims) >= limit:
+                return claims
+    return claims
+
+
+def generate_study_pack(args: argparse.Namespace) -> None:
+    case_dir = Path(args.case).resolve()
+    metadata_path = case_dir / "metadata.json"
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"metadata.json not found: {metadata_path}")
+    metadata = read_json(metadata_path)
+    segments = load_segments(case_dir)
+    keyframes = load_keyframes(case_dir)
+    chapters = segment_chapters(segments, args.chapter_minutes)
+    claims = extract_claim_candidates(segments, args.claims)
+    study_pack = case_dir / "study_pack"
+    study_pack.mkdir(parents=True, exist_ok=True)
+
+    context = {
+        "metadata": metadata,
+        "segments": segments,
+        "chapters": chapters,
+        "keyframes": keyframes,
+        "claims": claims,
+    }
+    write_json(case_dir / "analysis" / "study_pack_context.json", context)
+    write_json(case_dir / "analysis" / "claim_candidates.json", {"claims": claims})
+
+    outputs = {
+        "00_overview.md": render_overview(context),
+        "01_full_notes.md": render_full_notes(context),
+        "02_timeline.md": render_timeline(context),
+        "03_key_knowledge.md": render_key_knowledge(context),
+        "04_corrections_and_supplements.md": render_corrections(context),
+        "05_quiz.md": render_quiz(context),
+        "06_flashcards.md": render_flashcards(context),
+        "07_guided_learning_plan.md": render_guided_plan(context),
+        "08_practice_checklist.md": render_practice_checklist(context),
+    }
+    for name, content in outputs.items():
+        path = study_pack / name
+        if args.force or not path.exists() or args.overwrite_generated:
+            path.write_text(content, encoding="utf-8")
+    print(str(study_pack))
+
+
+def source_label(metadata: dict[str, Any]) -> str:
+    input_info = metadata.get("input", {})
+    return str(input_info.get("path") or input_info.get("raw_input") or "unknown")
+
+
+def render_overview(context: dict[str, Any]) -> str:
+    metadata = context["metadata"]
+    chapters = context["chapters"]
+    all_text = " ".join(ch.get("text", "") for ch in chapters)
+    keywords = extract_keywords(all_text, 12)
+    best = chapters[:5]
+    return "\n".join([
+        "# 一页速览",
+        "",
+        f"来源：`{source_label(metadata)}`",
+        "",
+        "## 视频主题",
+        "",
+        " / ".join(keywords[:5]) if keywords else "需要结合关键帧和转写进一步确认。",
+        "",
+        "## 核心收获",
+        "",
+        *[f"- {kw}" for kw in keywords[:7]],
+        "",
+        "## 最值得回看的时间点",
+        "",
+        *[f"- [{format_timestamp(ch['start'])}] {ch['title']}" for ch in best],
+        "",
+        "## 学习建议",
+        "",
+        "先按时间轴快速浏览，再逐章学习完整笔记。遇到 `04_corrections_and_supplements.md` 中的待核查点时，优先查官方资料后再记忆。",
+        "",
+    ])
+
+
+def render_full_notes(context: dict[str, Any]) -> str:
+    keyframes = context["keyframes"]
+    lines = ["# 完整学习笔记", ""]
+    if not context["chapters"]:
+        return "# 完整学习笔记\n\n未找到转写内容。请先提供字幕或运行转写。\n"
+    for ch in context["chapters"]:
+        frames = keyframes_near(keyframes, ch["start"], ch["end"])
+        lines += [
+            f"## [{format_timestamp(ch['start'])}-{format_timestamp(ch['end'])}] {ch['title']}",
+            "",
+            "讲了什么：",
+            "",
+            ch["summary"] or "TODO",
+            "",
+            "关键知识：",
+            "",
+            *[f"- {kw}" for kw in ch.get("keywords", [])[:6]],
+            "",
+            "画面补充：",
+            "",
+        ]
+        if frames:
+            lines += [f"- [{f.get('timestamp')}] `{Path(str(f.get('file'))).name}` ({f.get('reason')})" for f in frames]
+        else:
+            lines += ["- TODO: 检查本章附近关键帧。"]
+        lines += ["", "需要记住：", "", "- TODO: 由 AI 结合画面和事实核查补全。", ""]
+    return "\n".join(lines)
+
+
+def render_timeline(context: dict[str, Any]) -> str:
+    lines = ["# 时间轴", ""]
+    chapters = context["chapters"]
+    if chapters:
+        lines += [f"- [{format_timestamp(ch['start'])}] {ch['title']}：{ch['summary']}" for ch in chapters]
+    else:
+        lines += ["- TODO: 未找到转写内容。"]
+    return "\n".join(lines) + "\n"
+
+
+def render_key_knowledge(context: dict[str, Any]) -> str:
+    text = " ".join(ch.get("text", "") for ch in context["chapters"])
+    keywords = extract_keywords(text, 20)
+    lines = ["# 关键知识点", ""]
+    if not keywords:
+        return "# 关键知识点\n\n未找到足够文本。请先转写或提供字幕。\n"
+    for kw in keywords:
+        related = [
+            ch for ch in context["chapters"]
+            if kw in ch.get("text", "")
+        ][:3]
+        lines += [
+            f"## {kw}",
+            "",
+            "定义：TODO: 结合视频上下文和外部资料补全。",
+            "",
+            "为什么重要：TODO",
+            "",
+            "相关时间点：",
+            "",
+            *[f"- [{format_timestamp(ch['start'])}] {ch['title']}" for ch in related],
+            "",
+            "常见误区：TODO",
+            "",
+        ]
+    return "\n".join(lines)
+
+
+def render_corrections(context: dict[str, Any]) -> str:
+    lines = ["# 视频纠错与补充", "", "以下是自动抽取的待核查断言候选。需要 AI 联网或查权威资料后填写核查结论。", ""]
+    claims = context["claims"]
+    if not claims:
+        lines += ["暂无明显待核查断言。"]
+        return "\n".join(lines) + "\n"
+    for claim in claims:
+        lines += [
+            f"## [{claim['timestamp']}] 待核查说法",
+            "",
+            f"视频原说法：{claim['text']}",
+            "",
+            "核查结论：无法核查",
+            "",
+            "依据：TODO: 优先官方文档、标准、论文、教材或权威资料。",
+            "",
+            "建议学习者采用的说法：TODO",
+            "",
+        ]
+    return "\n".join(lines)
+
+
+def render_quiz(context: dict[str, Any]) -> str:
+    keywords = extract_keywords(" ".join(ch.get("text", "") for ch in context["chapters"]), 10)
+    lines = ["# 复习题", "", "## 基础题", ""]
+    for idx, kw in enumerate(keywords[:5], start=1):
+        lines.append(f"{idx}. 视频中 `{kw}` 主要指什么？")
+    lines += ["", "## 理解题", ""]
+    for idx, ch in enumerate(context["chapters"][:3], start=1):
+        lines.append(f"{idx}. [{format_timestamp(ch['start'])}] 这一段的核心逻辑是什么？")
+    lines += ["", "## 应用题", "", "1. 如果把视频里的方法用到自己的任务中，第一步应该做什么？", "", "## 答案", "", "TODO: 学习者作答后由 AI 结合笔记讲解。", ""]
+    return "\n".join(lines)
+
+
+def render_flashcards(context: dict[str, Any]) -> str:
+    keywords = extract_keywords(" ".join(ch.get("text", "") for ch in context["chapters"]), 12)
+    lines = ["# 闪卡", ""]
+    for kw in keywords:
+        related = next((ch for ch in context["chapters"] if kw in ch.get("text", "")), None)
+        source = format_timestamp(related["start"]) if related else "00:00:00.000"
+        lines += [f"Q: `{kw}` 是什么？", "", "A: TODO: 结合视频和核查资料补全。", "", f"Source: [{source}]", ""]
+    return "\n".join(lines)
+
+
+def render_guided_plan(context: dict[str, Any]) -> str:
+    lines = ["# AI 导学路线", "", "## 学习顺序", ""]
+    if context["chapters"]:
+        lines += [f"{idx}. [{format_timestamp(ch['start'])}] {ch['title']}" for idx, ch in enumerate(context["chapters"], start=1)]
+    else:
+        lines += ["1. 先补充字幕或转写。"]
+    lines += [
+        "",
+        "## 带学方式",
+        "",
+        "- 每次讲一个章节。",
+        "- 每章讲完后问 1-3 个问题。",
+        "- 学习者答错时，回到对应时间点解释。",
+        "- 遇到待核查断言，先查资料再给确定结论。",
+        "",
+        "## 完成标准",
+        "",
+        "- 能复述每章核心观点。",
+        "- 能回答复习题。",
+        "- 能指出视频中待核查或可能错误的说法。",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def render_practice_checklist(context: dict[str, Any]) -> str:
+    lines = ["# 实操清单", "", "## 环境准备", "", "- TODO: 从视频中提取工具、软件、数据、硬件要求。", "", "## 操作步骤", ""]
+    for idx, ch in enumerate(context["chapters"], start=1):
+        lines.append(f"{idx}. [{format_timestamp(ch['start'])}] 学习并复现：{ch['title']}")
+    lines += ["", "## 验证方法", "", "- TODO: 从视频中提取成功现象、测试命令或检查标准。", "", "## 常见错误", "", "- TODO: 结合视频演示和评论/外部资料补全。", ""]
+    return "\n".join(lines)
+
+
 def overview_template(metadata: dict[str, Any]) -> str:
     source = metadata.get("input", {}).get("path") or metadata.get("input", {}).get("raw_input")
     return f"""# 一页速览
@@ -828,9 +1313,10 @@ def make_plan(metadata: dict) -> str:
         ]
     elif kind in {"url", "share_text"}:
         lines += [
-            "1. Try public subtitles or permitted downloader for the detected platform.",
-            "2. If acquisition fails, ask the user for a local video/audio/subtitle file.",
-            "3. Continue with transcript, keyframes, visual notes, fact checks, and study pack.",
+            "1. Run `acquire-url` to try public subtitles first.",
+            "2. Use `acquire-url --download` only when media download is permitted and needed.",
+            "3. If acquisition fails, ask the user for a local video/audio/subtitle file.",
+            "4. Continue with transcript, keyframes, visual notes, fact checks, and study pack.",
         ]
     elif kind == "local_folder":
         lines += [
@@ -876,10 +1362,27 @@ def main(argv: list[str] | None = None) -> int:
     process.add_argument("--max-single-minutes", type=int, default=60, help="Warn when media exceeds this length")
     process.set_defaults(func=process_local)
 
+    acquire = sub.add_parser("acquire-url", help="Acquire public subtitles and optionally media for a URL/share case")
+    acquire.add_argument("--case", required=True, help="Case directory created by init")
+    acquire.add_argument("--download", action="store_true", help="Also download permitted media with yt-dlp")
+    acquire.add_argument("--dry-run", action="store_true", help="Write the acquisition plan without running yt-dlp")
+    acquire.add_argument("--sub-langs", default="zh.*,en.*", help="yt-dlp subtitle language selector")
+    acquire.add_argument("--format", default="bv*+ba/b", help="yt-dlp format selector used with --download")
+    acquire.add_argument("--timeout", type=int, default=600, help="Timeout in seconds for each yt-dlp command")
+    acquire.set_defaults(func=acquire_url)
+
     pack = sub.add_parser("study-pack-template", help="Create editable study pack template files for a case")
     pack.add_argument("--case", required=True, help="Case directory created by init")
     pack.add_argument("--force", action="store_true", help="Overwrite existing template files")
     pack.set_defaults(func=write_study_pack_template)
+
+    generate = sub.add_parser("generate-study-pack", help="Generate a draft study pack from transcript and keyframe indexes")
+    generate.add_argument("--case", required=True, help="Case directory created by init")
+    generate.add_argument("--chapter-minutes", type=int, default=8, help="Approximate chapter size for transcript grouping")
+    generate.add_argument("--claims", type=int, default=30, help="Maximum claim candidates to extract")
+    generate.add_argument("--force", action="store_true", help="Write files even if templates already exist")
+    generate.add_argument("--overwrite-generated", action="store_true", help="Overwrite existing study_pack files")
+    generate.set_defaults(func=generate_study_pack)
 
     args = parser.parse_args(argv)
     if hasattr(args, "language") and args.language == "":

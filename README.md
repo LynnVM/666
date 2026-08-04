@@ -56,10 +56,14 @@ This repository is still early, but it now contains a usable local-media pipelin
 - Extract 16 kHz mono WAV audio from local videos.
 - Extract timestamped uniform and scene-change keyframes from local videos.
 - Optionally transcribe audio with `faster-whisper`.
+- Acquire public subtitles from URL/share-text cases with `yt-dlp` when available.
+- Optionally acquire permitted public media from URL/share-text cases.
 - Create editable study-pack templates.
+- Generate draft study packs from transcripts and keyframe indexes.
+- Extract claim candidates that should be fact-checked.
 - Generate `metadata.json`, `study_plan.md`, `keyframes/keyframes.json`, `transcript/`, `reports/process_local.json`, and `study_pack/`.
 
-Platform URL adapters are specified but not yet fully automated. For Bilibili, Douyin, Xiaohongshu, and similar sites, the most reliable current path is to provide a local downloaded video.
+Platform URL acquisition is best-effort. It uses `yt-dlp` when available, tries public subtitles first, and can optionally download permitted public media. For Bilibili, Douyin, Xiaohongshu, and similar sites, the most reliable fallback is still a local downloaded video or subtitle file.
 
 ## Dependencies
 
@@ -81,6 +85,12 @@ For transcription:
 pip install faster-whisper
 ```
 
+For URL/share-link acquisition:
+
+```powershell
+pip install yt-dlp
+```
+
 If you already have `ffmpeg` and `ffprobe` on PATH, the script will use them. If system `ffmpeg` is missing, it tries `imageio-ffmpeg` for extraction. Media probing still needs `ffprobe`.
 
 ## Local Video Pipeline
@@ -95,6 +105,30 @@ For a folder of videos:
 
 ```powershell
 python .\video-study-extractor\scripts\video_study_case.py init-folder --input "D:\Videos\Course" --out ".\video-study-cases"
+```
+
+For a platform URL or copied share text:
+
+```powershell
+python .\video-study-extractor\scripts\video_study_case.py init --input "https://www.bilibili.com/video/BV..." --out ".\video-study-cases"
+```
+
+Check what acquisition would run:
+
+```powershell
+python .\video-study-extractor\scripts\video_study_case.py acquire-url --case ".\video-study-cases\bilibili-xxxxxxxxxxxx" --dry-run
+```
+
+Try public subtitles first:
+
+```powershell
+python .\video-study-extractor\scripts\video_study_case.py acquire-url --case ".\video-study-cases\bilibili-xxxxxxxxxxxx"
+```
+
+Optionally download permitted public media:
+
+```powershell
+python .\video-study-extractor\scripts\video_study_case.py acquire-url --case ".\video-study-cases\bilibili-xxxxxxxxxxxx" --download
 ```
 
 The script prints the created case directory. Then process local media:
@@ -115,6 +149,14 @@ Create editable study-pack files:
 python .\video-study-extractor\scripts\video_study_case.py study-pack-template --case ".\video-study-cases\lesson-xxxxxxxxxxxx"
 ```
 
+Generate a draft study pack from transcript and keyframe indexes:
+
+```powershell
+python .\video-study-extractor\scripts\video_study_case.py generate-study-pack --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --chapter-minutes 8 --claims 30 --force
+```
+
+This fills the study pack with a first-pass overview, chapter notes, timeline, key knowledge, quiz, flashcards, guided plan, practice checklist, and a correction file containing claim candidates for later fact-checking.
+
 After processing, ask Codex to inspect the generated case and produce the study pack:
 
 ```text
@@ -124,7 +166,8 @@ Use $video-study-extractor to finish the study pack for .\video-study-cases\less
 ## Roadmap
 
 - `v0.3`: Scene-change keyframes, folder batching, and study-pack templates.
-- `v0.4`: Study pack generation helpers and stronger transcript/keyframe fusion.
-- `v0.5`: Bilibili/YouTube public URL adapters.
-- `v0.6`: Douyin/Xiaohongshu share-link fallbacks and stronger OCR.
+- `v0.4`: Draft study pack generation and claim candidate extraction.
+- `v0.5`: Public URL/share-link acquisition adapter using `yt-dlp`, subtitles-first.
+- `v0.6`: Stronger transcript/keyframe fusion and OCR.
+- `v0.7`: Douyin/Xiaohongshu share-link fallbacks.
 - `v1.0`: Stable multi-platform video learning coach with fact-checking and guided study.

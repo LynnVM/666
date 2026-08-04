@@ -96,6 +96,14 @@ For share text or a URL:
 python <skill>/scripts/video_study_case.py init --input "https://www.bilibili.com/video/BV..." --out ".\video-study-cases"
 ```
 
+For a URL/share-text case, try public subtitles first:
+
+```powershell
+python <skill>/scripts/video_study_case.py acquire-url --case ".\video-study-cases\bilibili-xxxxxxxxxxxx"
+```
+
+Use `--dry-run` to inspect the planned `yt-dlp` commands before acquisition. Use `--download` only when downloading the public media is permitted and subtitles are insufficient.
+
 Then process local media when the case contains a local video or audio file:
 
 ```powershell
@@ -114,11 +122,17 @@ Create editable study pack files when the user wants a ready-to-fill output scaf
 python <skill>/scripts/video_study_case.py study-pack-template --case ".\video-study-cases\lesson-xxxxxxxxxxxx"
 ```
 
-After processing, read `metadata.json`, `reports/process_local.json`, `transcript/transcript.txt` if present, and `keyframes/keyframes.json`. Inspect the listed keyframes with vision tools before producing the study pack.
+Generate a first-pass study pack from transcripts and keyframe indexes:
+
+```powershell
+python <skill>/scripts/video_study_case.py generate-study-pack --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --chapter-minutes 8 --claims 30 --force
+```
+
+After acquisition or processing, read `metadata.json`, relevant reports such as `reports/acquire_url.json` and `reports/process_local.json`, `transcript/transcript.txt` if present, and `keyframes/keyframes.json`. Inspect the listed keyframes with vision tools before producing the study pack.
 
 ## Decision Rules
 
-- If the input is a platform URL and network or downloader support is missing, fall back to asking for a local file.
+- If the input is a platform URL and network or downloader support is missing, write the acquisition report and fall back to asking for a local file.
 - If the video has subtitles, use them first but still sample frames because visual content may contain important details not spoken aloud.
 - If transcript and visual evidence conflict, surface the conflict.
 - If the video is instructional, prioritize actionable steps, commands, prerequisites, common failures, and validation checks.
@@ -127,7 +141,7 @@ After processing, read `metadata.json`, `reports/process_local.json`, `transcrip
 
 ## Bundled Resources
 
-- `scripts/video_study_case.py`: Create case workspaces, batch-create cases from folders, classify inputs, extract URLs from share text, generate processing plans, extract local audio, extract uniform and scene-change keyframes, optionally transcribe with faster-whisper, and create study-pack template files.
+- `scripts/video_study_case.py`: Create case workspaces, batch-create cases from folders, classify inputs, extract URLs from share text, acquire public subtitles/media with `yt-dlp` when available, generate processing plans, extract local audio, extract uniform and scene-change keyframes, optionally transcribe with faster-whisper, create study-pack templates, generate first-pass study packs, and extract claim candidates for fact checking.
 - `references/platform-adapters.md`: Platform adapter strategy and fallback behavior for local files, Bilibili, Douyin, Xiaohongshu, YouTube, and generic URLs.
 - `references/output-templates.md`: Required study pack structure and formatting.
 - `references/fact-checking.md`: Claim extraction, source priority, correction report rules.
