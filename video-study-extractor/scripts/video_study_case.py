@@ -18,6 +18,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 
@@ -113,6 +114,24 @@ def which(name: str) -> str | None:
     return shutil.which(name)
 
 
+def find_python_module_binary(module: str, attr: str) -> str | None:
+    try:
+        mod = __import__(module, fromlist=[attr])
+        func = getattr(mod, attr)
+        value = func()
+        return str(value) if value else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def find_ffmpeg() -> str | None:
+    return which("ffmpeg") or find_python_module_binary("imageio_ffmpeg", "get_ffmpeg_exe")
+
+
+def find_ffprobe() -> str | None:
+    return which("ffprobe")
+
+
 def run_capture(cmd: list[str], timeout: int = 20) -> tuple[int, str]:
     try:
         p = subprocess.run(
@@ -129,9 +148,23 @@ def run_capture(cmd: list[str], timeout: int = 20) -> tuple[int, str]:
         return 1, str(exc)
 
 
+def run_checked(cmd: list[str], timeout: int | None = None) -> None:
+    p = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
+    if p.returncode != 0:
+        raise RuntimeError(f"Command failed ({p.returncode}): {' '.join(cmd)}\n{p.stdout}")
+
+
 def probe_media(path: Path) -> dict:
     probe = {"available": False}
-    ffprobe = which("ffprobe")
+    ffprobe = find_ffprobe()
     if not ffprobe:
         probe["error"] = "ffprobe not found"
         return probe
@@ -159,8 +192,44 @@ def probe_media(path: Path) -> dict:
     return probe
 
 
+def media_duration_seconds(probe: dict) -> float | None:
+    try:
+        duration = probe.get("format", {}).get("duration")
+        return float(duration) if duration is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def has_audio_stream(probe: dict) -> bool:
+    return any(stream.get("codec_type") == "audio" for stream in probe.get("streams", []))
+
+
+def has_video_stream(probe: dict) -> bool:
+    return any(stream.get("codec_type") == "video" for stream in probe.get("streams", []))
+
+
+def format_timestamp(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    total_ms = int(round(seconds * 1000))
+    ms = total_ms % 1000
+    total_s = total_ms // 1000
+    s = total_s % 60
+    total_m = total_s // 60
+    m = total_m % 60
+    h = total_m // 60
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+
+def srt_timestamp(seconds: float) -> str:
+    return format_timestamp(seconds).replace(".", ",")
+
+
 def write_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def create_case(args: argparse.Namespace) -> None:
@@ -186,8 +255,8 @@ def create_case(args: argparse.Namespace) -> None:
         "created_at": datetime.now(timezone.utc).isoformat(),
         "input": info,
         "tools": {
-            "ffmpeg": which("ffmpeg"),
-            "ffprobe": which("ffprobe"),
+            "ffmpeg": find_ffmpeg(),
+            "ffprobe": find_ffprobe(),
             "yt_dlp": which("yt-dlp") or which("yt_dlp"),
             "python": sys.executable,
         },
@@ -211,6 +280,213 @@ def create_case(args: argparse.Namespace) -> None:
     write_json(case_dir / "metadata.json", metadata)
     (case_dir / "study_plan.md").write_text(make_plan(metadata), encoding="utf-8")
     print(str(case_dir))
+
+
+def extract_audio(ffmpeg: str, source: Path, out_wav: Path) -> None:
+    out_wav.parent.mkdir(parents=True, exist_ok=True)
+    run_checked([
+        ffmpeg,
+        "-y",
+        "-i",
+        str(source),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "16000",
+        "-c:a",
+        "pcm_s16le",
+        str(out_wav),
+    ])
+
+
+def extract_uniform_keyframes(ffmpeg: str, source: Path, duration: float, out_dir: Path, count: int) -> list[dict]:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if duration <= 0:
+        duration = float(count)
+    frame_count = max(1, count)
+    if frame_count == 1:
+        times = [min(duration / 2, duration)]
+    else:
+        step = duration / frame_count
+        times = [min(duration - 0.2, step * i + step / 2) for i in range(frame_count)]
+    index = []
+    for idx, ts in enumerate(times, start=1):
+        ts = max(0.0, ts)
+        label = format_timestamp(ts).replace(":", "-").replace(".", "-")
+        frame_name = f"frame_{idx:03d}_{label}.jpg"
+        frame_path = out_dir / frame_name
+        run_checked([
+            ffmpeg,
+            "-y",
+            "-ss",
+            f"{ts:.3f}",
+            "-i",
+            str(source),
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+            str(frame_path),
+        ])
+        index.append({
+            "index": idx,
+            "timestamp_seconds": round(ts, 3),
+            "timestamp": format_timestamp(ts),
+            "file": str(frame_path),
+            "reason": "uniform_sample",
+        })
+    return index
+
+
+def write_segments_outputs(segments: list[dict], transcript_dir: Path) -> None:
+    transcript_dir.mkdir(parents=True, exist_ok=True)
+    write_json(transcript_dir / "segments.json", {"segments": segments})
+    text_lines = []
+    srt_lines = []
+    for i, seg in enumerate(segments, start=1):
+        start = float(seg["start"])
+        end = float(seg["end"])
+        text = str(seg["text"]).strip()
+        text_lines.append(f"[{format_timestamp(start)} - {format_timestamp(end)}] {text}")
+        srt_lines.extend([str(i), f"{srt_timestamp(start)} --> {srt_timestamp(end)}", text, ""])
+    (transcript_dir / "transcript.txt").write_text("\n".join(text_lines) + "\n", encoding="utf-8")
+    (transcript_dir / "transcript.srt").write_text("\n".join(srt_lines), encoding="utf-8")
+
+
+def transcribe_audio(audio_path: Path, transcript_dir: Path, model_size: str, language: str | None) -> dict:
+    try:
+        from faster_whisper import WhisperModel  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "available": False,
+            "error": f"faster-whisper unavailable: {exc}",
+            "next_step": "Install faster-whisper or provide an existing subtitle file.",
+        }
+    model = WhisperModel(model_size, device="auto", compute_type="auto")
+    segments_iter, info = model.transcribe(str(audio_path), language=language)
+    segments = [
+        {"start": seg.start, "end": seg.end, "text": seg.text}
+        for seg in segments_iter
+    ]
+    write_segments_outputs(segments, transcript_dir)
+    return {
+        "available": True,
+        "model_size": model_size,
+        "language": getattr(info, "language", language),
+        "language_probability": getattr(info, "language_probability", None),
+        "segments": len(segments),
+    }
+
+
+def process_local(args: argparse.Namespace) -> None:
+    case_dir = Path(args.case).resolve()
+    metadata_path = case_dir / "metadata.json"
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"metadata.json not found: {metadata_path}")
+    metadata = read_json(metadata_path)
+    input_info = metadata.get("input", {})
+    if input_info.get("kind") not in {"local_video", "local_audio"}:
+        raise ValueError("process-local requires a local_video or local_audio case")
+    source = Path(input_info["path"])
+    if not source.exists():
+        raise FileNotFoundError(str(source))
+
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg not found. Install ffmpeg or install imageio-ffmpeg in this Python environment.")
+
+    probe = metadata.get("media_probe")
+    if not probe or not probe.get("available"):
+        probe = probe_media(source)
+        metadata["media_probe"] = probe
+    duration = media_duration_seconds(probe) or 0.0
+
+    process_report: dict[str, Any] = {
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "source": str(source),
+        "duration_seconds": duration,
+        "ffmpeg": ffmpeg,
+        "audio": None,
+        "keyframes": None,
+        "transcription": None,
+        "warnings": [],
+    }
+
+    if duration > args.max_single_minutes * 60:
+        process_report["warnings"].append(
+            f"Video is longer than {args.max_single_minutes} minutes; split before final study-pack generation."
+        )
+
+    audio_path = case_dir / "audio" / "audio_16k_mono.wav"
+    if input_info.get("kind") == "local_audio":
+        audio_path = source
+        process_report["audio"] = {"mode": "source_audio", "file": str(audio_path)}
+    elif has_audio_stream(probe):
+        extract_audio(ffmpeg, source, audio_path)
+        process_report["audio"] = {"mode": "extracted", "file": str(audio_path)}
+    else:
+        process_report["warnings"].append("No audio stream found; transcription skipped.")
+
+    if input_info.get("kind") == "local_video" and has_video_stream(probe):
+        keyframes = extract_uniform_keyframes(
+            ffmpeg,
+            source,
+            duration,
+            case_dir / "keyframes",
+            args.keyframes,
+        )
+        write_json(case_dir / "keyframes" / "keyframes.json", {"frames": keyframes})
+        process_report["keyframes"] = {"count": len(keyframes), "index": "keyframes/keyframes.json"}
+    else:
+        process_report["warnings"].append("No video stream found; keyframe extraction skipped.")
+
+    if args.transcribe and process_report.get("audio"):
+        process_report["transcription"] = transcribe_audio(
+            audio_path,
+            case_dir / "transcript",
+            args.model,
+            args.language,
+        )
+    elif process_report.get("audio"):
+        process_report["transcription"] = {
+            "available": False,
+            "skipped": True,
+            "next_step": "Run again with --transcribe, or provide subtitle files.",
+        }
+
+    process_report["finished_at"] = datetime.now(timezone.utc).isoformat()
+    metadata["process_local"] = process_report
+    write_json(metadata_path, metadata)
+    write_json(case_dir / "reports" / "process_local.json", process_report)
+    (case_dir / "analysis" / "next_agent_steps.md").write_text(make_next_agent_steps(process_report), encoding="utf-8")
+    print(str(case_dir / "reports" / "process_local.json"))
+
+
+def make_next_agent_steps(report: dict[str, Any]) -> str:
+    lines = [
+        "# Next Agent Steps",
+        "",
+        "1. Read `metadata.json` and `reports/process_local.json`.",
+        "2. If `transcript/transcript.txt` exists, use it as the main speech evidence.",
+        "3. Inspect images listed in `keyframes/keyframes.json` with vision tools.",
+        "4. Align visual notes with transcript timestamps.",
+        "5. Extract factual claims and fact-check important ones.",
+        "6. Generate the required `study_pack/` files.",
+        "",
+        "## Processing Summary",
+        "",
+        f"- Source: `{report.get('source')}`",
+        f"- Duration seconds: `{report.get('duration_seconds')}`",
+        f"- Audio: `{report.get('audio')}`",
+        f"- Keyframes: `{report.get('keyframes')}`",
+        f"- Transcription: `{report.get('transcription')}`",
+    ]
+    warnings = report.get("warnings") or []
+    if warnings:
+        lines += ["", "## Warnings", ""]
+        lines += [f"- {warning}" for warning in warnings]
+    return "\n".join(lines) + "\n"
 
 
 def make_plan(metadata: dict) -> str:
@@ -277,7 +553,18 @@ def main(argv: list[str] | None = None) -> int:
     init.add_argument("--out", required=True, help="Output directory for case workspaces")
     init.set_defaults(func=create_case)
 
+    process = sub.add_parser("process-local", help="Extract audio/keyframes and optionally transcribe a local media case")
+    process.add_argument("--case", required=True, help="Case directory created by init")
+    process.add_argument("--keyframes", type=int, default=30, help="Number of uniform keyframes to extract")
+    process.add_argument("--transcribe", action="store_true", help="Transcribe extracted audio with faster-whisper")
+    process.add_argument("--model", default="small", help="faster-whisper model size or local model path")
+    process.add_argument("--language", default="zh", help="Transcription language, or empty string for auto")
+    process.add_argument("--max-single-minutes", type=int, default=60, help="Warn when media exceeds this length")
+    process.set_defaults(func=process_local)
+
     args = parser.parse_args(argv)
+    if hasattr(args, "language") and args.language == "":
+        args.language = None
     args.func(args)
     return 0
 

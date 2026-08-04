@@ -90,7 +90,19 @@ For share text or a URL:
 python <skill>/scripts/video_study_case.py init --input "https://www.bilibili.com/video/BV..." --out ".\video-study-cases"
 ```
 
-Then use the generated `study_plan.md` as the checklist for available local tools and next actions.
+Then process local media when the case contains a local video or audio file:
+
+```powershell
+python <skill>/scripts/video_study_case.py process-local --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --keyframes 30
+```
+
+Use optional transcription when `faster-whisper` is installed:
+
+```powershell
+python <skill>/scripts/video_study_case.py process-local --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --keyframes 30 --transcribe --model small --language zh
+```
+
+After processing, read `metadata.json`, `reports/process_local.json`, `transcript/transcript.txt` if present, and `keyframes/keyframes.json`. Inspect the listed keyframes with vision tools before producing the study pack.
 
 ## Decision Rules
 
@@ -103,7 +115,7 @@ Then use the generated `study_plan.md` as the checklist for available local tool
 
 ## Bundled Resources
 
-- `scripts/video_study_case.py`: Create case workspaces, classify inputs, extract URLs from share text, generate processing plans, and optionally inspect local media with available tools.
+- `scripts/video_study_case.py`: Create case workspaces, classify inputs, extract URLs from share text, generate processing plans, extract local audio, extract timestamped keyframes, and optionally transcribe with faster-whisper.
 - `references/platform-adapters.md`: Platform adapter strategy and fallback behavior for local files, Bilibili, Douyin, Xiaohongshu, YouTube, and generic URLs.
 - `references/output-templates.md`: Required study pack structure and formatting.
 - `references/fact-checking.md`: Claim extraction, source priority, correction report rules.
