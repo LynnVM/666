@@ -1,0 +1,7 @@
+interface:
+  display_name: "Video Study Extractor"
+  short_description: "Turn videos into guided study packs"
+  default_prompt: "Use $video-study-extractor to study this video and produce a timestamped learning pack."
+
+policy:
+  allow_implicit_invocation: true
