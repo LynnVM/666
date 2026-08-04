@@ -806,6 +806,9 @@ def transcribe_audio(
     device: str,
     compute_type: str,
 ) -> dict:
+    requested_device = device
+    requested_compute_type = compute_type
+    device, compute_type, runtime_note = resolve_transcription_runtime(device, compute_type)
     try:
         from faster_whisper import WhisperModel  # type: ignore
     except Exception as exc:  # noqa: BLE001
@@ -825,8 +828,11 @@ def transcribe_audio(
         return {
             "available": True,
             "model_size": model_size,
+            "requested_device": requested_device,
+            "requested_compute_type": requested_compute_type,
             "device": device,
             "compute_type": compute_type,
+            "runtime_note": runtime_note,
             "language": getattr(info, "language", language),
             "language_probability": getattr(info, "language_probability", None),
             "segments": len(segments),
@@ -836,10 +842,26 @@ def transcribe_audio(
             "available": False,
             "error": f"faster-whisper transcription failed: {exc}",
             "model_size": model_size,
+            "requested_device": requested_device,
+            "requested_compute_type": requested_compute_type,
             "device": device,
             "compute_type": compute_type,
             "next_step": "Retry with --device cpu --compute-type int8, clear a broken model cache, use another model size, or provide a subtitle file.",
         }
+
+
+def resolve_transcription_runtime(device: str, compute_type: str) -> tuple[str, str, str]:
+    requested = f"{device}/{compute_type}"
+    if device != "auto" and compute_type != "auto":
+        return device, compute_type, f"explicit runtime: {requested}"
+    cuda = detect_ctranslate2_cuda()
+    resolved_device = device
+    resolved_compute_type = compute_type
+    if device == "auto":
+        resolved_device = "cuda" if cuda.get("available") else "cpu"
+    if compute_type == "auto":
+        resolved_compute_type = "float16" if resolved_device == "cuda" else "int8"
+    return resolved_device, resolved_compute_type, f"auto runtime {requested} -> {resolved_device}/{resolved_compute_type}"
 
 
 def process_local(args: argparse.Namespace) -> None:
@@ -1352,11 +1374,66 @@ def module_available(module: str) -> bool:
         return False
 
 
+def detect_nvidia_smi() -> dict[str, Any]:
+    cmd = which("nvidia-smi")
+    if not cmd:
+        return {
+            "available": False,
+            "value": None,
+            "summary": "nvidia-smi not found",
+        }
+    code, out = run_capture([cmd, "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader"], timeout=10)
+    if code != 0:
+        return {
+            "available": False,
+            "value": cmd,
+            "summary": out,
+        }
+    gpus = [line.strip() for line in out.splitlines() if line.strip()]
+    return {
+        "available": bool(gpus),
+        "value": cmd,
+        "summary": "; ".join(gpus) if gpus else "no GPU rows returned",
+    }
+
+
+def detect_ctranslate2_cuda() -> dict[str, Any]:
+    try:
+        import ctranslate2  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "available": False,
+            "value": None,
+            "summary": f"ctranslate2 unavailable: {exc}",
+            "recommended_device": "cpu",
+            "recommended_compute_type": "int8",
+        }
+    try:
+        cuda_count = int(ctranslate2.get_cuda_device_count())
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "available": False,
+            "value": getattr(ctranslate2, "__version__", None),
+            "summary": f"could not query CUDA devices: {exc}",
+            "recommended_device": "cpu",
+            "recommended_compute_type": "int8",
+        }
+    return {
+        "available": cuda_count > 0,
+        "value": getattr(ctranslate2, "__version__", None),
+        "summary": f"cuda device count: {cuda_count}",
+        "recommended_device": "cuda" if cuda_count > 0 else "cpu",
+        "recommended_compute_type": "float16" if cuda_count > 0 else "int8",
+    }
+
+
 def doctor(args: argparse.Namespace) -> None:
     ffmpeg = find_ffmpeg()
     ffprobe = find_ffprobe()
     ytdlp = find_yt_dlp_cmd()
     bad_hf_files = find_zero_byte_hf_files()
+    nvidia = detect_nvidia_smi()
+    ct2_cuda = detect_ctranslate2_cuda()
     checks = [
         {
             "name": "python",
@@ -1393,6 +1470,20 @@ def doctor(args: argparse.Namespace) -> None:
             "install_hint": "Run `pip install faster-whisper`.",
         },
         {
+            "name": "nvidia-smi",
+            "available": nvidia["available"],
+            "value": nvidia["summary"],
+            "required_for": "GPU transcription diagnostics",
+            "install_hint": "Install/update the NVIDIA driver if you want GPU transcription.",
+        },
+        {
+            "name": "ctranslate2-cuda",
+            "available": ct2_cuda["available"],
+            "value": ct2_cuda["summary"],
+            "required_for": "faster-whisper GPU transcription",
+            "install_hint": "Install a CUDA-capable ctranslate2/faster-whisper stack, or use `--device cpu --compute-type int8`.",
+        },
+        {
             "name": "imageio-ffmpeg",
             "available": module_available("imageio_ffmpeg"),
             "value": find_python_module_binary("imageio_ffmpeg", "get_ffmpeg_exe"),
@@ -1410,11 +1501,15 @@ def doctor(args: argparse.Namespace) -> None:
     report = {
         "finished_at": datetime.now(timezone.utc).isoformat(),
         "python_version": sys.version,
+        "gpu_recommendation": {
+            "device": ct2_cuda["recommended_device"],
+            "compute_type": ct2_cuda["recommended_compute_type"],
+        },
         "checks": checks,
         "warnings": [
             f"{item['name']} missing: {item.get('install_hint')}"
             for item in checks
-            if not item["available"] and item["name"] in {"ffmpeg", "ffprobe", "huggingface-cache"}
+            if not item["available"] and item["name"] in {"ffmpeg", "ffprobe", "huggingface-cache", "ctranslate2-cuda"}
         ],
     }
     if args.out:
@@ -1426,6 +1521,15 @@ def doctor(args: argparse.Namespace) -> None:
 
 def render_doctor(report: dict[str, Any]) -> str:
     lines = ["# Video Study Extractor Doctor", ""]
+    gpu = report.get("gpu_recommendation") or {}
+    if gpu:
+        lines += [
+            "## Recommended Transcription Device",
+            "",
+            f"- Device: `{gpu.get('device')}`",
+            f"- Compute type: `{gpu.get('compute_type')}`",
+            "",
+        ]
     for item in report["checks"]:
         status = "OK" if item["available"] else "MISSING"
         lines += [
@@ -3312,8 +3416,8 @@ def main(argv: list[str] | None = None) -> int:
     study.add_argument("--transcribe", action="store_true", help="Transcribe downloaded media with faster-whisper")
     study.add_argument("--model", default="small", help="faster-whisper model")
     study.add_argument("--language", default="zh", help="Transcription language")
-    study.add_argument("--device", default="cpu", choices=["cpu", "cuda", "auto"], help="faster-whisper device")
-    study.add_argument("--compute-type", default="int8", help="faster-whisper compute type, for example int8, float16, or auto")
+    study.add_argument("--device", default="auto", choices=["cpu", "cuda", "auto"], help="faster-whisper device; auto uses CUDA when available, otherwise CPU")
+    study.add_argument("--compute-type", default="auto", help="faster-whisper compute type; auto uses float16 on CUDA and int8 on CPU")
     study.add_argument("--keyframes", type=int, default=30, help="Uniform keyframes for process-local")
     study.add_argument("--scene-keyframes", type=int, default=20, help="Scene-change keyframes for process-local")
     study.add_argument("--scene-threshold", type=float, default=0.35, help="Scene-change threshold")
@@ -3336,8 +3440,8 @@ def main(argv: list[str] | None = None) -> int:
     process.add_argument("--transcribe", action="store_true", help="Transcribe extracted audio with faster-whisper")
     process.add_argument("--model", default="small", help="faster-whisper model size or local model path")
     process.add_argument("--language", default="zh", help="Transcription language, or empty string for auto")
-    process.add_argument("--device", default="cpu", choices=["cpu", "cuda", "auto"], help="faster-whisper device")
-    process.add_argument("--compute-type", default="int8", help="faster-whisper compute type, for example int8, float16, or auto")
+    process.add_argument("--device", default="auto", choices=["cpu", "cuda", "auto"], help="faster-whisper device; auto uses CUDA when available, otherwise CPU")
+    process.add_argument("--compute-type", default="auto", help="faster-whisper compute type; auto uses float16 on CUDA and int8 on CPU")
     process.add_argument("--max-single-minutes", type=int, default=60, help="Warn when media exceeds this length")
     process.set_defaults(func=process_local)
 
@@ -3414,8 +3518,8 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--transcribe", action="store_true", help="Use faster-whisper during process-local")
     run.add_argument("--model", default="small", help="faster-whisper model")
     run.add_argument("--language", default="zh", help="Transcription language")
-    run.add_argument("--device", default="cpu", choices=["cpu", "cuda", "auto"], help="faster-whisper device")
-    run.add_argument("--compute-type", default="int8", help="faster-whisper compute type, for example int8, float16, or auto")
+    run.add_argument("--device", default="auto", choices=["cpu", "cuda", "auto"], help="faster-whisper device; auto uses CUDA when available, otherwise CPU")
+    run.add_argument("--compute-type", default="auto", help="faster-whisper compute type; auto uses float16 on CUDA and int8 on CPU")
     run.add_argument("--keyframes", type=int, default=30, help="Uniform keyframes for process-local")
     run.add_argument("--scene-keyframes", type=int, default=20, help="Scene-change keyframes for process-local")
     run.add_argument("--scene-threshold", type=float, default=0.35, help="Scene-change threshold")

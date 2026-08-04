@@ -112,7 +112,7 @@ If you already have `ffmpeg` and `ffprobe` on PATH, the script will use them. If
 For the normal "give AI one video link, let it study the video, then coach the learner" workflow, use `study-url`.
 
 ```powershell
-python .\video-study-extractor\scripts\video_study_case.py study-url --input "https://www.bilibili.com/video/BV..." --out ".\video-study-cases" --download --transcribe --model small --language zh --device cpu --compute-type int8
+python .\video-study-extractor\scripts\video_study_case.py study-url --input "https://www.bilibili.com/video/BV..." --out ".\video-study-cases" --download --transcribe --model small --language zh
 ```
 
 This command creates a case, acquires permitted media, extracts audio and keyframes, transcribes speech, cleans the transcript, generates the backend study pack, exports an AI-guided replication script, and validates the case.
@@ -123,10 +123,22 @@ The final files are printed at the end. For interactive coaching, the AI should 
 
 Then it should start the first reproduction step in chat: explain the goal, prerequisites, principle chain, first command/check, and what output the learner should send back.
 
-Use CPU by default on Windows because it is reliable without CUDA. If CUDA is installed correctly, use:
+By default, transcription uses `--device auto --compute-type auto`: CUDA/float16 when ctranslate2 can see a CUDA GPU, otherwise CPU/int8. To force GPU, use:
 
 ```powershell
 python .\video-study-extractor\scripts\video_study_case.py study-url --input "https://www.bilibili.com/video/BV..." --out ".\video-study-cases" --download --transcribe --model small --language zh --device cuda --compute-type float16
+```
+
+Run `doctor` first to see the recommended transcription device:
+
+```powershell
+python .\video-study-extractor\scripts\video_study_case.py doctor
+```
+
+If `doctor` reports `Device: cuda` and `Compute type: float16`, the default auto mode will use GPU. If CUDA fails with a library error, force CPU:
+
+```powershell
+python .\video-study-extractor\scripts\video_study_case.py process-local --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --keyframes 30 --scene-keyframes 20 --transcribe --model small --language zh --device cpu --compute-type int8
 ```
 
 ## Local Video Pipeline

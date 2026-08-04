@@ -94,13 +94,25 @@ Check local dependencies first when setup is uncertain:
 python <skill>/scripts/video_study_case.py doctor
 ```
 
+Transcription defaults to `--device auto --compute-type auto`: use CUDA/float16 when ctranslate2 can see a CUDA GPU, otherwise use CPU/int8. Run `doctor` to see what auto mode will choose. To force GPU transcription:
+
+```powershell
+python <skill>/scripts/video_study_case.py process-local --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --keyframes 30 --scene-keyframes 20 --transcribe --model small --language zh --device cuda --compute-type float16
+```
+
+If CUDA fails with a missing DLL, driver, cuBLAS, cuDNN, or ctranslate2 error, retry with reliable CPU mode:
+
+```powershell
+python <skill>/scripts/video_study_case.py process-local --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --keyframes 30 --scene-keyframes 20 --transcribe --model small --language zh --device cpu --compute-type int8
+```
+
 For the normal "user gives one video link, AI learns it and then coaches the user" workflow, prefer the one-command URL workflow:
 
 ```powershell
-python <skill>/scripts/video_study_case.py study-url --input "https://www.bilibili.com/video/BV..." --out ".\video-study-cases" --download --transcribe --model small --language zh --device cpu --compute-type int8
+python <skill>/scripts/video_study_case.py study-url --input "https://www.bilibili.com/video/BV..." --out ".\video-study-cases" --download --transcribe --model small --language zh
 ```
 
-This command should be the default for URL/share-text requests when media acquisition is permitted. It creates the case, acquires media, processes local media if available, transcribes speech, cleans the transcript, generates the backend study pack, exports the study-and-replication script, and validates the case. Use `--device cuda --compute-type float16` only when CUDA is installed and working. Add `--write-subs` only if the user explicitly wants platform subtitles as auxiliary evidence.
+This command should be the default for URL/share-text requests when media acquisition is permitted. It creates the case, acquires media, processes local media if available, transcribes speech, cleans the transcript, generates the backend study pack, exports the study-and-replication script, and validates the case. Auto mode uses GPU when available and CPU when not. Add `--write-subs` only if the user explicitly wants platform subtitles as auxiliary evidence.
 
 After this command succeeds, read `study_pack/09_study_session.md` and start coaching in chat. Do not answer with only "files generated" unless the user explicitly asks for files.
 
@@ -226,6 +238,8 @@ After acquisition or processing, read `metadata.json`, relevant reports such as 
 
 - If the input is a platform URL and network or downloader support is missing, write the acquisition report and fall back to asking for a local file.
 - If environment setup is uncertain, run `doctor` before media processing.
+- If transcription is requested, default to auto mode. Run `doctor`; auto mode uses `--device cuda --compute-type float16` when `ctranslate2-cuda` is available, otherwise `--device cpu --compute-type int8`.
+- If GPU transcription fails, preserve the error in the report and retry with `--device cpu --compute-type int8` rather than blocking the whole learning workflow.
 - If the case state is unclear, run `next-steps` and follow the highest-priority command.
 - If generated outputs look incomplete, run `validate-case` and address warnings/errors.
 - If the user wants to learn interactively or reproduce what the video teaches, run `export-study-session` after notes and fact-check queue are generated, then start the first coaching step in chat.
