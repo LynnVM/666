@@ -51,6 +51,7 @@ Use $video-study-extractor to study this video: D:\Videos\lesson.mp4
 This repository is still early, but it now contains a usable local-media pipeline:
 
 - Create a repeatable study case workspace.
+- Check local dependencies with `doctor`.
 - Classify local files, folders, URLs, and share text.
 - Probe local media when `ffprobe` is available.
 - Extract 16 kHz mono WAV audio from local videos.
@@ -58,11 +59,17 @@ This repository is still early, but it now contains a usable local-media pipelin
 - Optionally transcribe audio with `faster-whisper`.
 - Acquire public subtitles from URL/share-text cases with `yt-dlp` when available.
 - Optionally acquire permitted public media from URL/share-text cases.
+- Plan and optionally execute long-video splitting into smaller part cases.
+- Merge processed part cases into a course-level study pack scaffold.
 - Clean SRT/VTT/TXT transcripts, merge overly short captions, and generate chapter JSON.
 - Create a frame-observation worksheet so AI can inspect keyframes with nearby transcript context.
 - Create editable study-pack templates.
 - Generate draft study packs from transcripts and keyframe indexes.
+- Export an interactive study-session script for AI-guided learning.
 - Extract claim candidates that should be fact-checked.
+- Recommend the next command for an in-progress case.
+- Validate case workspaces and report missing outputs.
+- Preview or run the offline case pipeline with one command.
 - Generate `metadata.json`, `study_plan.md`, `keyframes/keyframes.json`, `transcript/`, `reports/process_local.json`, and `study_pack/`.
 
 Platform URL acquisition is best-effort. It uses `yt-dlp` when available, tries public subtitles first, and can optionally download permitted public media. For Bilibili, Douyin, Xiaohongshu, and similar sites, the most reliable fallback is still a local downloaded video or subtitle file.
@@ -96,6 +103,12 @@ pip install yt-dlp
 If you already have `ffmpeg` and `ffprobe` on PATH, the script will use them. If system `ffmpeg` is missing, it tries `imageio-ffmpeg` for extraction. Media probing still needs `ffprobe`.
 
 ## Local Video Pipeline
+
+Check local dependencies:
+
+```powershell
+python .\video-study-extractor\scripts\video_study_case.py doctor
+```
 
 Create a case workspace:
 
@@ -137,6 +150,54 @@ The script prints the created case directory. Then process local media:
 
 ```powershell
 python .\video-study-extractor\scripts\video_study_case.py process-local --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --keyframes 30 --scene-keyframes 20
+```
+
+For long videos, first generate a split plan:
+
+```powershell
+python .\video-study-extractor\scripts\video_study_case.py split-media --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --part-minutes 25
+```
+
+To actually cut the media and create one case per part:
+
+```powershell
+python .\video-study-extractor\scripts\video_study_case.py split-media --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --part-minutes 25 --execute
+```
+
+After processing each part case, merge the parts back into a course-level scaffold:
+
+```powershell
+python .\video-study-extractor\scripts\video_study_case.py merge-parts --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --force
+```
+
+Create a prioritized fact-check queue:
+
+```powershell
+python .\video-study-extractor\scripts\video_study_case.py fact-check-queue --case ".\video-study-cases\lesson-xxxxxxxxxxxx"
+```
+
+Ask the script what to do next for a case:
+
+```powershell
+python .\video-study-extractor\scripts\video_study_case.py next-steps --case ".\video-study-cases\lesson-xxxxxxxxxxxx"
+```
+
+Validate a case workspace:
+
+```powershell
+python .\video-study-extractor\scripts\video_study_case.py validate-case --case ".\video-study-cases\lesson-xxxxxxxxxxxx"
+```
+
+Export an AI-guided study session:
+
+```powershell
+python .\video-study-extractor\scripts\video_study_case.py export-study-session --case ".\video-study-cases\lesson-xxxxxxxxxxxx"
+```
+
+Preview the remaining offline pipeline:
+
+```powershell
+python .\video-study-extractor\scripts\video_study_case.py run-pipeline --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --dry-run
 ```
 
 To also transcribe with faster-whisper:
@@ -195,5 +256,5 @@ Use $video-study-extractor to finish the study pack for .\video-study-cases\less
 - `v0.4`: Draft study pack generation and claim candidate extraction.
 - `v0.5`: Public URL/share-link acquisition adapter using `yt-dlp`, subtitles-first.
 - `v0.6`: Transcript cleaning, chapter JSON, frame-observation worksheets, and offline self-test fixture.
-- `v0.7`: Douyin/Xiaohongshu share-link fallbacks.
+- `v0.7`: Long-video split plans, optional FFmpeg part cutting, child case generation, part merging, fact-check queues, dependency doctor, next-step recommendations, case validation, study-session export, and pipeline runner.
 - `v1.0`: Stable multi-platform video learning coach with fact-checking and guided study.

@@ -27,8 +27,9 @@ Default user-facing language: Chinese, unless the user asks otherwise.
 
 3. Split long videos.
    - If duration is 60 minutes or less, process as one unit.
-   - If duration is over 60 minutes, split into chapter-based parts when chapters exist; otherwise split into 20-30 minute parts.
-   - Process parts independently, then merge repeated concepts and produce one global study pack.
+   - If duration is over 60 minutes, run `split-media` to create a split plan. Use `--execute` only when the user wants actual part files.
+   - Prefer chapter-based parts when chapters exist; otherwise split into 20-30 minute parts with a small overlap.
+   - Process parts independently, then run `merge-parts` to create a course-level scaffold.
 
 4. Extract transcript.
    - Prefer user-provided or platform-provided subtitles.
@@ -53,6 +54,7 @@ Default user-facing language: Chinese, unless the user asks otherwise.
 
 8. Fact-check important claims.
    - Extract explicit factual claims, technical claims, commands, configuration advice, safety claims, formulas, and definitions.
+   - Run `fact-check-queue` after claim candidates exist, especially for long videos with multiple part cases.
    - Verify unstable or high-impact claims using current authoritative sources when browsing is available.
    - Prefer official docs, standards, textbooks, papers, and vendor documentation.
    - Mark unverified claims honestly. Do not invent citations.
@@ -78,6 +80,12 @@ Default user-facing language: Chinese, unless the user asks otherwise.
    - Do not merely repeat the notes; act as a study coach.
 
 ## Quick Start
+
+Check local dependencies first when setup is uncertain:
+
+```powershell
+python <skill>/scripts/video_study_case.py doctor
+```
 
 For a local video or folder, first create a case workspace:
 
@@ -109,6 +117,54 @@ Then process local media when the case contains a local video or audio file:
 
 ```powershell
 python <skill>/scripts/video_study_case.py process-local --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --keyframes 30 --scene-keyframes 20
+```
+
+For long videos, generate a split plan first:
+
+```powershell
+python <skill>/scripts/video_study_case.py split-media --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --part-minutes 25
+```
+
+Use `--execute` to cut media parts and create child cases:
+
+```powershell
+python <skill>/scripts/video_study_case.py split-media --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --part-minutes 25 --execute
+```
+
+After part cases are processed, merge them:
+
+```powershell
+python <skill>/scripts/video_study_case.py merge-parts --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --force
+```
+
+Create a fact-check queue:
+
+```powershell
+python <skill>/scripts/video_study_case.py fact-check-queue --case ".\video-study-cases\lesson-xxxxxxxxxxxx"
+```
+
+When a case is partially processed, ask the script for recommended next commands:
+
+```powershell
+python <skill>/scripts/video_study_case.py next-steps --case ".\video-study-cases\lesson-xxxxxxxxxxxx"
+```
+
+Validate case completeness:
+
+```powershell
+python <skill>/scripts/video_study_case.py validate-case --case ".\video-study-cases\lesson-xxxxxxxxxxxx"
+```
+
+Export an interactive study-coach script:
+
+```powershell
+python <skill>/scripts/video_study_case.py export-study-session --case ".\video-study-cases\lesson-xxxxxxxxxxxx"
+```
+
+Preview the remaining offline pipeline:
+
+```powershell
+python <skill>/scripts/video_study_case.py run-pipeline --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --dry-run
 ```
 
 Use optional transcription when `faster-whisper` is installed:
@@ -152,6 +208,12 @@ After acquisition or processing, read `metadata.json`, relevant reports such as 
 ## Decision Rules
 
 - If the input is a platform URL and network or downloader support is missing, write the acquisition report and fall back to asking for a local file.
+- If environment setup is uncertain, run `doctor` before media processing.
+- If the case state is unclear, run `next-steps` and follow the highest-priority command.
+- If generated outputs look incomplete, run `validate-case` and address warnings/errors.
+- If the user wants to learn interactively, run `export-study-session` after notes and fact-check queue are generated.
+- If the user wants fewer manual commands, run `run-pipeline --dry-run` first, then run without `--dry-run` only for safe offline steps.
+- If local media is longer than 60 minutes, split it before final study-pack generation unless the user explicitly wants one large case.
 - If the video has subtitles, use them first but still sample frames because visual content may contain important details not spoken aloud.
 - If subtitles are too fragmented or noisy, run `clean-transcript` before generating notes.
 - If keyframes exist, run `frame-notes` and fill visual observations before finalizing notes.
@@ -162,7 +224,7 @@ After acquisition or processing, read `metadata.json`, relevant reports such as 
 
 ## Bundled Resources
 
-- `scripts/video_study_case.py`: Create case workspaces, batch-create cases from folders, classify inputs, extract URLs from share text, acquire public subtitles/media with `yt-dlp` when available, generate processing plans, extract local audio, extract uniform and scene-change keyframes, optionally transcribe with faster-whisper, clean transcript segments, generate chapter JSON, create frame-observation worksheets, create study-pack templates, generate first-pass study packs, run an offline self-test fixture, and extract claim candidates for fact checking.
+- `scripts/video_study_case.py`: Check dependencies, create case workspaces, validate case completeness, batch-create cases from folders, classify inputs, extract URLs from share text, acquire public subtitles/media with `yt-dlp` when available, recommend next commands, generate processing plans, run or preview offline pipeline steps, split long local media into part cases, merge processed part cases, extract local audio, extract uniform and scene-change keyframes, optionally transcribe with faster-whisper, clean transcript segments, generate chapter JSON, create frame-observation worksheets, create study-pack templates, generate first-pass study packs, create fact-check queues, export interactive study sessions, run an offline self-test fixture, and extract claim candidates for fact checking.
 - `references/platform-adapters.md`: Platform adapter strategy and fallback behavior for local files, Bilibili, Douyin, Xiaohongshu, YouTube, and generic URLs.
 - `references/output-templates.md`: Required study pack structure and formatting.
 - `references/fact-checking.md`: Claim extraction, source priority, correction report rules.
