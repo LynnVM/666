@@ -58,6 +58,8 @@ This repository is still early, but it now contains a usable local-media pipelin
 - Optionally transcribe audio with `faster-whisper`.
 - Acquire public subtitles from URL/share-text cases with `yt-dlp` when available.
 - Optionally acquire permitted public media from URL/share-text cases.
+- Clean SRT/VTT/TXT transcripts, merge overly short captions, and generate chapter JSON.
+- Create a frame-observation worksheet so AI can inspect keyframes with nearby transcript context.
 - Create editable study-pack templates.
 - Generate draft study packs from transcripts and keyframe indexes.
 - Extract claim candidates that should be fact-checked.
@@ -143,6 +145,24 @@ To also transcribe with faster-whisper:
 python .\video-study-extractor\scripts\video_study_case.py process-local --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --keyframes 30 --scene-keyframes 20 --transcribe --model small --language zh
 ```
 
+Clean subtitles/transcripts before generating the study pack:
+
+```powershell
+python .\video-study-extractor\scripts\video_study_case.py clean-transcript --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --chapter-minutes 8
+```
+
+If you have a separate subtitle file:
+
+```powershell
+python .\video-study-extractor\scripts\video_study_case.py clean-transcript --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --source "D:\Videos\lesson.srt"
+```
+
+Create a visual observation worksheet from extracted keyframes:
+
+```powershell
+python .\video-study-extractor\scripts\video_study_case.py frame-notes --case ".\video-study-cases\lesson-xxxxxxxxxxxx"
+```
+
 Create editable study-pack files:
 
 ```powershell
@@ -157,6 +177,12 @@ python .\video-study-extractor\scripts\video_study_case.py generate-study-pack -
 
 This fills the study pack with a first-pass overview, chapter notes, timeline, key knowledge, quiz, flashcards, guided plan, practice checklist, and a correction file containing claim candidates for later fact-checking.
 
+Run an offline self-test fixture:
+
+```powershell
+python .\video-study-extractor\scripts\video_study_case.py self-test --out ".\work\self-test"
+```
+
 After processing, ask Codex to inspect the generated case and produce the study pack:
 
 ```text
@@ -168,6 +194,6 @@ Use $video-study-extractor to finish the study pack for .\video-study-cases\less
 - `v0.3`: Scene-change keyframes, folder batching, and study-pack templates.
 - `v0.4`: Draft study pack generation and claim candidate extraction.
 - `v0.5`: Public URL/share-link acquisition adapter using `yt-dlp`, subtitles-first.
-- `v0.6`: Stronger transcript/keyframe fusion and OCR.
+- `v0.6`: Transcript cleaning, chapter JSON, frame-observation worksheets, and offline self-test fixture.
 - `v0.7`: Douyin/Xiaohongshu share-link fallbacks.
 - `v1.0`: Stable multi-platform video learning coach with fact-checking and guided study.

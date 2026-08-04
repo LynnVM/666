@@ -34,6 +34,7 @@ Default user-facing language: Chinese, unless the user asks otherwise.
    - Prefer user-provided or platform-provided subtitles.
    - Otherwise extract audio and transcribe with faster-whisper, whisper.cpp, cloud ASR, or the locally available toolchain.
    - Keep timestamps. Produce text, SRT, and machine-readable segments when possible.
+   - Run transcript cleaning before study-pack generation when subtitles or transcript segments are available.
 
 5. Extract keyframes.
    - Use more than uniform sampling: combine uniform frames, scene-change frames, slide/text-change frames, code-screen frames, and user-requested timestamps.
@@ -128,12 +129,32 @@ Generate a first-pass study pack from transcripts and keyframe indexes:
 python <skill>/scripts/video_study_case.py generate-study-pack --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --chapter-minutes 8 --claims 30 --force
 ```
 
-After acquisition or processing, read `metadata.json`, relevant reports such as `reports/acquire_url.json` and `reports/process_local.json`, `transcript/transcript.txt` if present, and `keyframes/keyframes.json`. Inspect the listed keyframes with vision tools before producing the study pack.
+For better output quality, clean transcript segments before generation:
+
+```powershell
+python <skill>/scripts/video_study_case.py clean-transcript --case ".\video-study-cases\lesson-xxxxxxxxxxxx" --chapter-minutes 8
+```
+
+Create a visual observation worksheet after keyframes exist:
+
+```powershell
+python <skill>/scripts/video_study_case.py frame-notes --case ".\video-study-cases\lesson-xxxxxxxxxxxx"
+```
+
+Run an offline fixture to verify the installed script:
+
+```powershell
+python <skill>/scripts/video_study_case.py self-test --out ".\work\video-study-self-test"
+```
+
+After acquisition or processing, read `metadata.json`, relevant reports such as `reports/acquire_url.json`, `reports/process_local.json`, `reports/clean_transcript.json`, `transcript/transcript.txt`, `analysis/chapters.json`, `analysis/frame_observations.md`, and `keyframes/keyframes.json`. Inspect the listed keyframes with vision tools before producing the study pack.
 
 ## Decision Rules
 
 - If the input is a platform URL and network or downloader support is missing, write the acquisition report and fall back to asking for a local file.
 - If the video has subtitles, use them first but still sample frames because visual content may contain important details not spoken aloud.
+- If subtitles are too fragmented or noisy, run `clean-transcript` before generating notes.
+- If keyframes exist, run `frame-notes` and fill visual observations before finalizing notes.
 - If transcript and visual evidence conflict, surface the conflict.
 - If the video is instructional, prioritize actionable steps, commands, prerequisites, common failures, and validation checks.
 - If the video is entertainment or commentary, prioritize timeline, claims, viewpoints, and evidence rather than forcing technical templates.
@@ -141,7 +162,7 @@ After acquisition or processing, read `metadata.json`, relevant reports such as 
 
 ## Bundled Resources
 
-- `scripts/video_study_case.py`: Create case workspaces, batch-create cases from folders, classify inputs, extract URLs from share text, acquire public subtitles/media with `yt-dlp` when available, generate processing plans, extract local audio, extract uniform and scene-change keyframes, optionally transcribe with faster-whisper, create study-pack templates, generate first-pass study packs, and extract claim candidates for fact checking.
+- `scripts/video_study_case.py`: Create case workspaces, batch-create cases from folders, classify inputs, extract URLs from share text, acquire public subtitles/media with `yt-dlp` when available, generate processing plans, extract local audio, extract uniform and scene-change keyframes, optionally transcribe with faster-whisper, clean transcript segments, generate chapter JSON, create frame-observation worksheets, create study-pack templates, generate first-pass study packs, run an offline self-test fixture, and extract claim candidates for fact checking.
 - `references/platform-adapters.md`: Platform adapter strategy and fallback behavior for local files, Bilibili, Douyin, Xiaohongshu, YouTube, and generic URLs.
 - `references/output-templates.md`: Required study pack structure and formatting.
 - `references/fact-checking.md`: Claim extraction, source priority, correction report rules.

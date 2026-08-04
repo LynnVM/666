@@ -262,6 +262,11 @@ def read_text_if_exists(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
 
 
+def ensure_case_dirs(case_dir: Path) -> None:
+    for sub in ["transcript", "keyframes", "analysis", "reports", "study_pack"]:
+        (case_dir / sub).mkdir(parents=True, exist_ok=True)
+
+
 def build_case(args_input: str, out_dir: Path) -> Path:
     info = classify_input(args_input)
     fingerprint = sha256_text(args_input)[:12]
@@ -742,15 +747,13 @@ def write_study_pack_template(args: argparse.Namespace) -> None:
 
 
 def load_segments(case_dir: Path) -> list[dict[str, Any]]:
+    clean_path = case_dir / "transcript" / "clean_segments.json"
     segments_path = case_dir / "transcript" / "segments.json"
     transcript_path = case_dir / "transcript" / "transcript.txt"
-    if segments_path.exists():
-        data = read_json(segments_path)
-        return [
-            {"start": float(s.get("start", 0.0)), "end": float(s.get("end", 0.0)), "text": str(s.get("text", "")).strip()}
-            for s in data.get("segments", [])
-            if str(s.get("text", "")).strip()
-        ]
+    for path in [clean_path, segments_path]:
+        if path.exists():
+            data = read_json(path)
+            return normalize_segments(data.get("segments", []))
     text = read_text_if_exists(transcript_path).strip()
     if not text:
         return []
@@ -765,6 +768,174 @@ def load_segments(case_dir: Path) -> list[dict[str, Any]]:
         else:
             segments.append({"start": float(idx * 30), "end": float((idx + 1) * 30), "text": line})
     return segments
+
+
+def normalize_segments(raw_segments: list[Any]) -> list[dict[str, Any]]:
+    segments = []
+    for item in raw_segments:
+        if not isinstance(item, dict):
+            continue
+        text = clean_caption_text(str(item.get("text", "")))
+        if not text:
+            continue
+        start = safe_float(item.get("start", 0.0))
+        end = safe_float(item.get("end", start + 1.0))
+        if end < start:
+            end = start
+        segments.append({"start": start, "end": end, "text": text})
+    segments.sort(key=lambda s: (float(s["start"]), float(s["end"])))
+    return segments
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def clean_caption_text(text: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\{\\.*?\}", " ", text)
+    text = text.replace("&nbsp;", " ").replace("&amp;", "&")
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"^\s*[-–—]\s*", "", text)
+    return text.strip()
+
+
+def parse_srt_or_vtt(text: str) -> list[dict[str, Any]]:
+    text = text.replace("\ufeff", "").replace("\r\n", "\n").replace("\r", "\n")
+    blocks = re.split(r"\n{2,}", text.strip())
+    segments = []
+    for block in blocks:
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if not lines:
+            continue
+        if lines[0].upper().startswith("WEBVTT"):
+            lines = lines[1:]
+        if lines and re.fullmatch(r"\d+", lines[0]):
+            lines = lines[1:]
+        if not lines or "-->" not in lines[0]:
+            continue
+        start_text, end_text = [part.strip().split()[0] for part in lines[0].split("-->", 1)]
+        caption = clean_caption_text(" ".join(lines[1:]))
+        if caption:
+            segments.append({
+                "start": parse_timestamp(start_text),
+                "end": parse_timestamp(end_text),
+                "text": caption,
+            })
+    return normalize_segments(segments)
+
+
+def find_transcript_source(case_dir: Path, metadata: dict[str, Any], explicit: str | None = None) -> Path | None:
+    if explicit:
+        path = Path(explicit)
+        return path.resolve() if path.exists() else None
+    input_info = metadata.get("input", {})
+    if input_info.get("kind") == "subtitle" and input_info.get("path"):
+        path = Path(input_info["path"])
+        if path.exists():
+            return path
+    for pattern in ["*.srt", "*.vtt", "*.txt"]:
+        matches = sorted((case_dir / "transcript" / "subtitles").glob(pattern))
+        if matches:
+            return matches[0]
+    for name in ["transcript.srt", "transcript.vtt", "transcript.txt"]:
+        path = case_dir / "transcript" / name
+        if path.exists():
+            return path
+    return None
+
+
+def load_segments_from_source(source: Path) -> list[dict[str, Any]]:
+    text = read_text_if_exists(source)
+    if source.suffix.lower() in {".srt", ".vtt"} or "-->" in text:
+        return parse_srt_or_vtt(text)
+    segments = []
+    for idx, line in enumerate(text.splitlines()):
+        line = clean_caption_text(line)
+        if not line:
+            continue
+        m = re.match(r"\[([0-9:.,]+)\s+-\s+([0-9:.,]+)\]\s*(.*)", line)
+        if m:
+            segments.append({"start": parse_timestamp(m.group(1)), "end": parse_timestamp(m.group(2)), "text": m.group(3)})
+        else:
+            segments.append({"start": idx * 30.0, "end": (idx + 1) * 30.0, "text": line})
+    return normalize_segments(segments)
+
+
+def merge_short_segments(
+    segments: list[dict[str, Any]],
+    max_gap: float,
+    max_chars: int,
+    max_duration: float,
+) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    for seg in normalize_segments(segments):
+        if not merged:
+            merged.append(dict(seg))
+            continue
+        prev = merged[-1]
+        gap = float(seg["start"]) - float(prev["end"])
+        combined = clean_caption_text(f"{prev['text']} {seg['text']}")
+        duration = float(seg["end"]) - float(prev["start"])
+        if gap <= max_gap and len(combined) <= max_chars and duration <= max_duration:
+            prev["end"] = max(float(prev["end"]), float(seg["end"]))
+            prev["text"] = combined
+        else:
+            merged.append(dict(seg))
+    return merged
+
+
+def clean_transcript(args: argparse.Namespace) -> None:
+    case_dir = Path(args.case).resolve()
+    metadata_path = case_dir / "metadata.json"
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"metadata.json not found: {metadata_path}")
+    ensure_case_dirs(case_dir)
+    metadata = read_json(metadata_path)
+    source = find_transcript_source(case_dir, metadata, args.source)
+    if source:
+        raw_segments = load_segments_from_source(source)
+    else:
+        raw_segments = load_segments(case_dir)
+    if not raw_segments:
+        raise ValueError("No transcript or subtitle content found. Provide --source or run transcription first.")
+
+    cleaned = merge_short_segments(
+        raw_segments,
+        max_gap=args.max_gap,
+        max_chars=args.max_chars,
+        max_duration=args.max_duration,
+    )
+    chapters = segment_chapters(cleaned, args.chapter_minutes)
+    transcript_dir = case_dir / "transcript"
+    write_json(transcript_dir / "clean_segments.json", {
+        "source": str(source) if source else "existing transcript segments",
+        "raw_count": len(raw_segments),
+        "segments": cleaned,
+    })
+    write_segments_outputs(cleaned, transcript_dir)
+    write_json(case_dir / "analysis" / "chapters.json", {"chapters": chapters})
+    report = {
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "source": str(source) if source else None,
+        "raw_segments": len(raw_segments),
+        "clean_segments": len(cleaned),
+        "chapters": len(chapters),
+        "outputs": [
+            "transcript/clean_segments.json",
+            "transcript/segments.json",
+            "transcript/transcript.txt",
+            "transcript/transcript.srt",
+            "analysis/chapters.json",
+        ],
+    }
+    metadata["clean_transcript"] = report
+    write_json(metadata_path, metadata)
+    write_json(case_dir / "reports" / "clean_transcript.json", report)
+    print(str(case_dir / "reports" / "clean_transcript.json"))
 
 
 def parse_timestamp(value: str) -> float:
@@ -784,6 +955,63 @@ def load_keyframes(case_dir: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     return read_json(path).get("frames", [])
+
+
+def frame_notes(args: argparse.Namespace) -> None:
+    case_dir = Path(args.case).resolve()
+    metadata_path = case_dir / "metadata.json"
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"metadata.json not found: {metadata_path}")
+    ensure_case_dirs(case_dir)
+    keyframes = load_keyframes(case_dir)
+    segments = load_segments(case_dir)
+    out_path = case_dir / "analysis" / "frame_observations.md"
+    lines = [
+        "# Frame Observations",
+        "",
+        "Use this file as the visual evidence pass. Inspect each listed image with vision tools, then fill the fields.",
+        "",
+    ]
+    if not keyframes:
+        lines += [
+            "No keyframes were found. Run `process-local` on a local video case first.",
+            "",
+        ]
+    for frame in keyframes[: args.limit]:
+        timestamp = str(frame.get("timestamp") or format_timestamp(safe_float(frame.get("timestamp_seconds"))))
+        frame_file = str(frame.get("file") or "")
+        nearby = nearest_segment_text(segments, safe_float(frame.get("timestamp_seconds")), args.context_seconds)
+        lines += [
+            f"## [{timestamp}] {Path(frame_file).name}",
+            "",
+            f"- File: `{frame_file}`",
+            f"- Reason: {frame.get('reason') or 'keyframe'}",
+            f"- Nearby transcript: {nearby or 'TODO'}",
+            "- Visible text/OCR: TODO",
+            "- Diagram/code/UI observation: TODO",
+            "- Learning value: TODO",
+            "- Possible mismatch with transcript: TODO",
+            "",
+        ]
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    report = {
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "frames_total": len(keyframes),
+        "frames_written": min(len(keyframes), args.limit),
+        "output": "analysis/frame_observations.md",
+    }
+    write_json(case_dir / "reports" / "frame_notes.json", report)
+    print(str(out_path))
+
+
+def nearest_segment_text(segments: list[dict[str, Any]], timestamp: float, window: float) -> str:
+    nearby = [
+        str(seg.get("text", ""))
+        for seg in segments
+        if abs(safe_float(seg.get("start")) - timestamp) <= window
+        or safe_float(seg.get("start")) <= timestamp <= safe_float(seg.get("end"))
+    ]
+    return summarize_text(" ".join(nearby), 260)
 
 
 def segment_chapters(segments: list[dict[str, Any]], chapter_minutes: int) -> list[dict[str, Any]]:
@@ -920,6 +1148,56 @@ def generate_study_pack(args: argparse.Namespace) -> None:
         if args.force or not path.exists() or args.overwrite_generated:
             path.write_text(content, encoding="utf-8")
     print(str(study_pack))
+
+
+def self_test(args: argparse.Namespace) -> None:
+    out_dir = Path(args.out).resolve()
+    case_dir = build_case("v0.6 self test subtitle", out_dir)
+    sample = """1
+00:00:00,000 --> 00:00:02,000
+今天我们学习机器人建图。
+
+2
+00:00:02,200 --> 00:00:05,000
+如果里程计方向错了，地图可能会旋转。
+
+3
+00:00:05,200 --> 00:00:08,000
+所以必须检查 TF、雷达安装方向和坐标系。
+
+4
+00:00:15,000 --> 00:00:19,000
+建图完成后应该保存地图并验证定位效果。
+"""
+    subtitle_path = case_dir / "transcript" / "sample.srt"
+    subtitle_path.write_text(sample, encoding="utf-8")
+    clean_args = argparse.Namespace(
+        case=str(case_dir),
+        source=str(subtitle_path),
+        max_gap=1.0,
+        max_chars=120,
+        max_duration=12.0,
+        chapter_minutes=5,
+    )
+    clean_transcript(clean_args)
+    keyframes = [
+        {"timestamp_seconds": 1.0, "timestamp": format_timestamp(1.0), "file": str(case_dir / "keyframes" / "frame_001.jpg"), "reason": "self-test"},
+        {"timestamp_seconds": 6.0, "timestamp": format_timestamp(6.0), "file": str(case_dir / "keyframes" / "frame_002.jpg"), "reason": "self-test"},
+    ]
+    write_json(case_dir / "keyframes" / "keyframes.json", {"frames": keyframes})
+    frame_notes(argparse.Namespace(case=str(case_dir), limit=20, context_seconds=10.0))
+    generate_study_pack(argparse.Namespace(case=str(case_dir), chapter_minutes=5, claims=10, force=True, overwrite_generated=True))
+    report = {
+        "case": str(case_dir),
+        "checks": [
+            "transcript/clean_segments.json",
+            "analysis/chapters.json",
+            "analysis/frame_observations.md",
+            "study_pack/00_overview.md",
+        ],
+    }
+    write_json(case_dir / "reports" / "self_test.json", report)
+    print(str(case_dir / "reports" / "self_test.json"))
 
 
 def source_label(metadata: dict[str, Any]) -> str:
@@ -1371,6 +1649,21 @@ def main(argv: list[str] | None = None) -> int:
     acquire.add_argument("--timeout", type=int, default=600, help="Timeout in seconds for each yt-dlp command")
     acquire.set_defaults(func=acquire_url)
 
+    clean = sub.add_parser("clean-transcript", help="Clean subtitles/transcripts, merge short captions, and build chapters")
+    clean.add_argument("--case", required=True, help="Case directory created by init")
+    clean.add_argument("--source", help="Optional SRT/VTT/TXT transcript source")
+    clean.add_argument("--max-gap", type=float, default=1.2, help="Maximum gap in seconds for merging adjacent captions")
+    clean.add_argument("--max-chars", type=int, default=180, help="Maximum merged segment length")
+    clean.add_argument("--max-duration", type=float, default=18.0, help="Maximum merged segment duration in seconds")
+    clean.add_argument("--chapter-minutes", type=int, default=8, help="Approximate chapter size")
+    clean.set_defaults(func=clean_transcript)
+
+    frames = sub.add_parser("frame-notes", help="Create a visual observation worksheet from keyframes")
+    frames.add_argument("--case", required=True, help="Case directory created by init")
+    frames.add_argument("--limit", type=int, default=80, help="Maximum keyframes to include")
+    frames.add_argument("--context-seconds", type=float, default=15.0, help="Transcript window around each frame")
+    frames.set_defaults(func=frame_notes)
+
     pack = sub.add_parser("study-pack-template", help="Create editable study pack template files for a case")
     pack.add_argument("--case", required=True, help="Case directory created by init")
     pack.add_argument("--force", action="store_true", help="Overwrite existing template files")
@@ -1383,6 +1676,10 @@ def main(argv: list[str] | None = None) -> int:
     generate.add_argument("--force", action="store_true", help="Write files even if templates already exist")
     generate.add_argument("--overwrite-generated", action="store_true", help="Overwrite existing study_pack files")
     generate.set_defaults(func=generate_study_pack)
+
+    test = sub.add_parser("self-test", help="Run a small offline pipeline test fixture")
+    test.add_argument("--out", required=True, help="Output directory for the test case")
+    test.set_defaults(func=self_test)
 
     args = parser.parse_args(argv)
     if hasattr(args, "language") and args.language == "":
