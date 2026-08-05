@@ -16,6 +16,8 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import wave
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -1453,6 +1455,197 @@ def detect_ctranslate2_cuda() -> dict[str, Any]:
     }
 
 
+def find_dll(name: str) -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+    for folder in os.environ.get("PATH", "").split(os.pathsep):
+        if not folder:
+            continue
+        path = Path(folder) / name
+        try:
+            if path.exists():
+                resolved = str(path.resolve())
+                if resolved not in seen:
+                    seen.add(resolved)
+                    found.append(resolved)
+        except OSError:
+            continue
+    return found
+
+
+def gpu_check(args: argparse.Namespace) -> None:
+    dll_names = [
+        "cublas64_12.dll",
+        "cublasLt64_12.dll",
+        "cudart64_12.dll",
+        "cudnn64_9.dll",
+        "cudnn_ops64_9.dll",
+        "cudnn_cnn64_9.dll",
+    ]
+    nvidia = detect_nvidia_smi()
+    ct2_cuda = detect_ctranslate2_cuda()
+    dlls = {name: find_dll(name) for name in dll_names}
+    faster_whisper = module_available("faster_whisper")
+    model_load: dict[str, Any] = {
+        "enabled": args.load_model,
+        "model": args.model,
+        "device": args.device,
+        "compute_type": args.compute_type,
+        "ok": None,
+        "error": None,
+    }
+    smoke_test: dict[str, Any] = {
+        "enabled": args.smoke_transcribe,
+        "model": args.model,
+        "device": args.device,
+        "compute_type": args.compute_type,
+        "ok": None,
+        "error": None,
+        "segments": None,
+    }
+    if args.load_model:
+        try:
+            from faster_whisper import WhisperModel  # type: ignore
+            WhisperModel(args.model, device=args.device, compute_type=args.compute_type)
+            model_load["ok"] = True
+        except Exception as exc:  # noqa: BLE001
+            model_load["ok"] = False
+            model_load["error"] = str(exc)
+    if args.smoke_transcribe:
+        try:
+            from faster_whisper import WhisperModel  # type: ignore
+            with tempfile.TemporaryDirectory(prefix="video-study-gpu-check-") as tmp:
+                wav_path = Path(tmp) / "silence_16k_mono.wav"
+                write_silence_wav(wav_path, seconds=args.smoke_seconds)
+                model = WhisperModel(args.model, device=args.device, compute_type=args.compute_type)
+                segments_iter, _ = model.transcribe(str(wav_path), language=args.language)
+                smoke_test["segments"] = len(list(segments_iter))
+            smoke_test["ok"] = True
+        except Exception as exc:  # noqa: BLE001
+            smoke_test["ok"] = False
+            smoke_test["error"] = str(exc)
+    missing = [name for name, paths in dlls.items() if not paths]
+    report = {
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "python": sys.executable,
+        "nvidia_smi": nvidia,
+        "ctranslate2_cuda": ct2_cuda,
+        "faster_whisper_available": faster_whisper,
+        "dlls": dlls,
+        "missing_dlls": missing,
+        "model_load": model_load,
+        "smoke_test": smoke_test,
+        "diagnosis": gpu_check_diagnosis(nvidia, ct2_cuda, faster_whisper, missing, model_load, smoke_test),
+    }
+    if args.out:
+        out_path = Path(args.out).resolve()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        write_json(out_path, report)
+    print(render_gpu_check(report))
+
+
+def gpu_check_diagnosis(
+    nvidia: dict[str, Any],
+    ct2_cuda: dict[str, Any],
+    faster_whisper: bool,
+    missing_dlls: list[str],
+    model_load: dict[str, Any],
+    smoke_test: dict[str, Any],
+) -> list[str]:
+    notes: list[str] = []
+    if not nvidia.get("available"):
+        notes.append("NVIDIA driver/GPU is not visible. Install or update the NVIDIA driver before GPU transcription.")
+    elif not ct2_cuda.get("available"):
+        notes.append("ctranslate2 cannot see a CUDA device. Reinstall a CUDA-capable ctranslate2 stack or use CPU mode.")
+    elif not faster_whisper:
+        notes.append("faster-whisper is not installed, so transcription cannot use GPU or CPU through this script.")
+    elif missing_dlls:
+        notes.append("CUDA is visible, but required CUDA/cuDNN DLLs are missing from PATH. Install CUDA 12 runtime/cuDNN 9 or add their bin directories to PATH.")
+    if model_load.get("enabled") and model_load.get("ok") is False:
+        error = str(model_load.get("error") or "")
+        if "cannot find the appropriate snapshot" in error or "CERTIFICATE_VERIFY_FAILED" in error or "Connection" in error:
+            notes.append("Whisper model load test could not reach or find the requested model. Use an already cached model or pass a local faster-whisper model path to isolate CUDA issues.")
+        else:
+            notes.append(f"Whisper GPU model load failed: {error}")
+    if smoke_test.get("enabled") and smoke_test.get("ok") is False:
+        error = str(smoke_test.get("error") or "")
+        if "cublas64_12.dll" in error or "cudnn" in error.lower() or "cudart" in error.lower():
+            notes.append("Whisper GPU smoke transcription failed because CUDA/cuDNN runtime DLLs are not loadable.")
+        elif "cannot find the appropriate snapshot" in error or "CERTIFICATE_VERIFY_FAILED" in error or "Connection" in error:
+            notes.append("Whisper smoke transcription could not reach or find the requested model. Use an already cached model or pass a local model path.")
+        else:
+            notes.append(f"Whisper GPU smoke transcription failed: {error}")
+    if not notes:
+        notes.append("GPU transcription environment looks usable for faster-whisper.")
+    return notes
+
+
+def write_silence_wav(path: Path, seconds: float = 1.0) -> None:
+    sample_rate = 16000
+    frames = int(sample_rate * max(0.1, seconds))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(b"\x00\x00" * frames)
+
+
+def render_gpu_check(report: dict[str, Any]) -> str:
+    lines = [
+        "# GPU Transcription Check",
+        "",
+        f"- Python: `{report.get('python')}`",
+        f"- faster-whisper: `{'OK' if report.get('faster_whisper_available') else 'MISSING'}`",
+        "",
+        "## NVIDIA Driver",
+        "",
+        f"- Status: `{'OK' if report['nvidia_smi'].get('available') else 'MISSING'}`",
+        f"- Value: `{report['nvidia_smi'].get('summary')}`",
+        "",
+        "## ctranslate2 CUDA",
+        "",
+        f"- Status: `{'OK' if report['ctranslate2_cuda'].get('available') else 'MISSING'}`",
+        f"- Value: `{report['ctranslate2_cuda'].get('summary')}`",
+        "",
+        "## CUDA/cuDNN DLLs On PATH",
+        "",
+    ]
+    for name, paths in report.get("dlls", {}).items():
+        lines.append(f"- `{name}`: `{'OK' if paths else 'MISSING'}`")
+        for path in paths[:3]:
+            lines.append(f"  - `{path}`")
+    load = report.get("model_load") or {}
+    if load.get("enabled"):
+        lines += [
+            "",
+            "## Whisper GPU Load Test",
+            "",
+            f"- Model: `{load.get('model')}`",
+            f"- Runtime: `{load.get('device')}/{load.get('compute_type')}`",
+            f"- Status: `{'OK' if load.get('ok') else 'FAILED'}`",
+        ]
+        if load.get("error"):
+            lines.append(f"- Error: `{load.get('error')}`")
+    smoke = report.get("smoke_test") or {}
+    if smoke.get("enabled"):
+        lines += [
+            "",
+            "## Whisper GPU Smoke Transcription",
+            "",
+            f"- Model: `{smoke.get('model')}`",
+            f"- Runtime: `{smoke.get('device')}/{smoke.get('compute_type')}`",
+            f"- Status: `{'OK' if smoke.get('ok') else 'FAILED'}`",
+        ]
+        if smoke.get("segments") is not None:
+            lines.append(f"- Segments: `{smoke.get('segments')}`")
+        if smoke.get("error"):
+            lines.append(f"- Error: `{smoke.get('error')}`")
+    lines += ["", "## Diagnosis", ""]
+    lines += [f"- {note}" for note in report.get("diagnosis", [])]
+    return "\n".join(lines)
+
+
 def doctor(args: argparse.Namespace) -> None:
     ffmpeg = find_ffmpeg()
     ffprobe = find_ffprobe()
@@ -1829,13 +2022,13 @@ def pipeline_steps(case_dir: Path, metadata: dict[str, Any], args: argparse.Name
         steps.append({"name": name, "enabled": enabled, "reason": reason, "func": func})
 
     def transcript_ready() -> bool:
-        return (case_dir / "transcript" / "segments.json").exists() or (case_dir / "transcript" / "transcript.txt").exists()
+        return has_usable_transcript(case_dir)
 
     def subtitle_ready() -> bool:
-        return any((case_dir / "transcript" / "subtitles").glob(pattern) for pattern in ["*.srt", "*.vtt", "*.txt"])
+        return any(path.stat().st_size > 0 for pattern in ["*.srt", "*.vtt", "*.txt"] for path in (case_dir / "transcript" / "subtitles").glob(pattern))
 
     def clean_ready() -> bool:
-        return (case_dir / "transcript" / "clean_segments.json").exists()
+        return has_usable_clean_transcript(case_dir)
 
     def transcript_source_ready() -> bool:
         return transcript_ready() or subtitle_ready() or clean_ready()
@@ -1892,7 +2085,9 @@ def pipeline_steps(case_dir: Path, metadata: dict[str, Any], args: argparse.Name
     add(
         "clean-transcript",
         lambda: (transcript_ready() or subtitle_ready()) and not clean_ready(),
-        lambda: "Transcript has already been cleaned." if clean_ready() else "Transcript exists but has not been cleaned.",
+        lambda: "Transcript has already been cleaned." if clean_ready()
+        else "Transcript exists but has not been cleaned." if (transcript_ready() or subtitle_ready())
+        else "No usable transcript or subtitle is available.",
         lambda: clean_transcript(argparse.Namespace(
             case=str(case_dir),
             source=None,
@@ -2247,6 +2442,18 @@ def load_segments(case_dir: Path) -> list[dict[str, Any]]:
         else:
             segments.append({"start": float(idx * 30), "end": float((idx + 1) * 30), "text": line})
     return segments
+
+
+def has_usable_transcript(case_dir: Path) -> bool:
+    return bool(load_segments(case_dir))
+
+
+def has_usable_clean_transcript(case_dir: Path) -> bool:
+    path = case_dir / "transcript" / "clean_segments.json"
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    data = read_json(path)
+    return bool(normalize_segments(data.get("segments", [])))
 
 
 def normalize_segments(raw_segments: list[Any]) -> list[dict[str, Any]]:
@@ -3520,6 +3727,17 @@ def main(argv: list[str] | None = None) -> int:
     doc = sub.add_parser("doctor", help="Check local dependencies and print setup guidance")
     doc.add_argument("--out", help="Optional JSON report path")
     doc.set_defaults(func=doctor)
+
+    gpu = sub.add_parser("gpu-check", help="Diagnose faster-whisper GPU transcription dependencies")
+    gpu.add_argument("--load-model", action="store_true", help="Also try loading a faster-whisper model on CUDA")
+    gpu.add_argument("--smoke-transcribe", action="store_true", help="Run a tiny silent WAV transcription on the selected runtime")
+    gpu.add_argument("--model", default="tiny", help="Model name/path for --load-model")
+    gpu.add_argument("--device", default="cuda", choices=["cuda", "cpu"], help="Runtime device for --load-model")
+    gpu.add_argument("--compute-type", default="float16", help="Compute type for --load-model")
+    gpu.add_argument("--language", default="zh", help="Language for --smoke-transcribe")
+    gpu.add_argument("--smoke-seconds", type=float, default=1.0, help="Silent WAV duration for --smoke-transcribe")
+    gpu.add_argument("--out", help="Optional JSON report path")
+    gpu.set_defaults(func=gpu_check)
 
     init = sub.add_parser("init", help="Create a case workspace")
     init.add_argument("--input", required=True, help="Video path, folder, URL, subtitle, or share text")
